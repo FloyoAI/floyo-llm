@@ -90,6 +90,3 @@ public/      Static assets
 
 Issues and pull requests are welcome. If you build something on top of this, share it with us at https://floyo.ai.
 
-## License
-
-Add your own `LICENSE` file (MIT is a common choice for open source).
