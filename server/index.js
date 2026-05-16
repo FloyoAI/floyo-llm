@@ -174,6 +174,37 @@ function publicUploadMetadata(uploaded = {}, fallback = {}) {
   };
 }
 
+function mapRunCreationError(error, selection = {}) {
+  const isGenericCreateFailure =
+    error?.status === 500 &&
+    String(error?.data?.message || "").toLowerCase() === "failed to create run";
+
+  if (!isGenericCreateFailure) {
+    return error;
+  }
+
+  const workflowLabel = selection?.type === "qwen" ? "Qwen multimodal workflow" : "LLM workflow";
+  const mapped = new Error(
+    `${workflowLabel} could not be started with this key. The key is valid for upload, but Floyo rejected run creation. Check Partner Nodes wallet balance, team run permissions, and whether API nodes are available for this team.`,
+  );
+  mapped.status = 422;
+  mapped.details = {
+    code: "run_creation_rejected",
+    originalStatus: error.status,
+    originalMessage: error?.data?.message || error?.message || "Failed to create run",
+    checks: [
+      "Add balance to Partner Nodes wallet in Floyo",
+      "Verify the API key belongs to the active team workspace",
+      "Run the same workflow once in Floyo canvas and inspect failed status tooltip",
+    ],
+    docs: [
+      "https://docs.floyo.ai/floyo-partner-nodes",
+      "https://docs.floyo.ai/run-history-and-queue",
+    ],
+  };
+  return mapped;
+}
+
 async function prepareMediaForWorkflow(media = [], floyoContext = {}) {
   const normalizedMedia = normalizeMedia(media);
   const prepared = [];
@@ -420,7 +451,12 @@ app.post("/api/chat", requireAppAccess, async (request, response, next) => {
       media,
     });
 
-    const run = await createRun(workflowPayload, floyoContext);
+    let run;
+    try {
+      run = await createRun(workflowPayload, floyoContext);
+    } catch (error) {
+      throw mapRunCreationError(error, selection);
+    }
     const shouldWait = parsed.waitForCompletion ?? true;
     const finalRun = shouldWait
       ? await pollRun(run.id, { timeoutMs: parsed.pollTimeoutMs || 180000, ...floyoContext })

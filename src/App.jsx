@@ -14,6 +14,7 @@ import {
   Film,
   FolderOpen,
   Image as ImageIcon,
+  KeyRound,
   LibraryBig,
   Loader2,
   MessageSquarePlus,
@@ -39,6 +40,8 @@ import remarkGfm from "remark-gfm";
 
 const SETTINGS_STORAGE_KEY = "floyo-llm-codex-settings";
 const CONVERSATIONS_STORAGE_KEY = "floyo-llm-codex-conversations";
+const SESSION_ACCESS_TOKEN_STORAGE_KEY = "floyo-llm-codex-session-access-token";
+const SESSION_ACCESS_ACCOUNT_STORAGE_KEY = "floyo-llm-codex-session-access-account";
 const LEGACY_ACCESS_TOKEN_STORAGE_KEY = "floyo-llm-codex-access-token";
 const LEGACY_ACCESS_ACCOUNT_STORAGE_KEY = "floyo-llm-codex-access-account";
 const DEFAULT_ACCOUNT_ID = "guest";
@@ -284,18 +287,49 @@ function clearSavedAccess() {
     localStorage.removeItem(LEGACY_ACCESS_TOKEN_STORAGE_KEY);
     localStorage.removeItem(LEGACY_ACCESS_ACCOUNT_STORAGE_KEY);
   } catch {
-    // Access tokens are intentionally never persisted.
+    // Legacy access tokens are intentionally removed from persistent storage.
+  }
+}
+
+function tokenLooksLikeFloyoKey(value = "") {
+  return String(value || "").trim().startsWith("flo_");
+}
+
+function writeSessionAccess(token, accountId = DEFAULT_ACCOUNT_ID) {
+  try {
+    sessionStorage.setItem(SESSION_ACCESS_TOKEN_STORAGE_KEY, token);
+    sessionStorage.setItem(SESSION_ACCESS_ACCOUNT_STORAGE_KEY, accountId || DEFAULT_ACCOUNT_ID);
+  } catch {
+    // Some private browser contexts can block sessionStorage.
+  }
+}
+
+function clearSessionAccess() {
+  try {
+    sessionStorage.removeItem(SESSION_ACCESS_TOKEN_STORAGE_KEY);
+    sessionStorage.removeItem(SESSION_ACCESS_ACCOUNT_STORAGE_KEY);
+  } catch {
+    // Some private browser contexts can block sessionStorage.
   }
 }
 
 function readSavedAccessToken() {
   clearSavedAccess();
-  return "";
+  try {
+    return sessionStorage.getItem(SESSION_ACCESS_TOKEN_STORAGE_KEY) || "";
+  } catch {
+    return "";
+  }
 }
 
 function readInitialAccessState() {
   clearSavedAccess();
-  const accountId = DEFAULT_ACCOUNT_ID;
+  let accountId = DEFAULT_ACCOUNT_ID;
+  try {
+    accountId = sessionStorage.getItem(SESSION_ACCESS_ACCOUNT_STORAGE_KEY) || DEFAULT_ACCOUNT_ID;
+  } catch {
+    accountId = DEFAULT_ACCOUNT_ID;
+  }
   const conversations = readSavedConversations(accountId);
   return {
     accountId,
@@ -319,6 +353,7 @@ async function apiRequest(path, options = {}, accessToken = "") {
   if (!response.ok) {
     const error = new Error(data.message || data.error || `Request failed with ${response.status}`);
     error.status = response.status;
+    error.details = data.details;
     throw error;
   }
 
@@ -375,12 +410,12 @@ function sleep(ms) {
   return new Promise((resolve) => window.setTimeout(resolve, ms));
 }
 
-function StatusPill({ config }) {
-  const ready = config?.hasApiKey;
+function StatusPill({ config, accessVerified, requiresAccessToken }) {
+  const ready = requiresAccessToken ? accessVerified : config?.hasApiKey;
   return (
     <span className={classNames("status-pill", ready ? "ready" : "blocked")}>
       {ready ? <CheckCircle2 size={14} /> : <XCircle size={14} />}
-      {ready ? "API key set" : "API key missing"}
+      {ready ? "API key active" : "API key required"}
     </span>
   );
 }
@@ -411,7 +446,7 @@ function AccessGate({ accessToken, accessDenied, isCheckingAccess, onVerifyAcces
             Setup instructions
           </a>
         </p>
-        <p className="access-note">Your key is used only for this browser session and is cleared when the page refreshes.</p>
+        <p className="access-note">Your key is stored only in this browser tab session. You can change it from the header at any time.</p>
         <input
           name="accessToken"
           type="password"
@@ -1194,6 +1229,7 @@ export default function App() {
       const nextAccountId = verification.accountId || DEFAULT_ACCOUNT_ID;
       setAccessToken(nextToken);
       setAccessAccountId(nextAccountId);
+      writeSessionAccess(nextToken, nextAccountId);
       if (nextAccountId !== accessAccountId) {
         loadAccountConversations(nextAccountId);
       }
@@ -1201,6 +1237,17 @@ export default function App() {
       setShowAccessPrompt(false);
       return true;
     } catch (error) {
+      if (error.status === 404 && tokenLooksLikeFloyoKey(nextToken)) {
+        setAccessToken(nextToken);
+        setAccessAccountId(DEFAULT_ACCOUNT_ID);
+        writeSessionAccess(nextToken, DEFAULT_ACCOUNT_ID);
+        setAccessVerified(true);
+        setShowAccessPrompt(false);
+        setAccessDenied(false);
+        setNotice("API key saved for this session. The next request will validate it with Floyo.");
+        window.setTimeout(() => setNotice(""), 3200);
+        return true;
+      }
       setAccessVerified(false);
       setAccessDenied(true);
       return false;
@@ -1242,14 +1289,20 @@ export default function App() {
         if (!isCancelled) {
           const nextAccountId = verification.accountId || DEFAULT_ACCOUNT_ID;
           setAccessAccountId(nextAccountId);
+          writeSessionAccess(accessToken, nextAccountId);
           if (nextAccountId !== accessAccountId) {
             loadAccountConversations(nextAccountId);
           }
           setAccessVerified(true);
         }
       })
-      .catch(() => {
+      .catch((error) => {
         if (!isCancelled) {
+          if (error.status === 404 && accessToken.trim() && tokenLooksLikeFloyoKey(accessToken)) {
+            setAccessVerified(true);
+            setAccessDenied(false);
+            return;
+          }
           setAccessVerified(false);
           setAccessDenied(true);
         }
@@ -1301,6 +1354,17 @@ export default function App() {
     setAccessDenied(false);
     setShowAccessPrompt(true);
   }, []);
+
+  const handleChangeAccessKey = useCallback(() => {
+    clearSessionAccess();
+    setAccessToken("");
+    setAccessVerified(false);
+    setAccessDenied(false);
+    setAccessAccountId(DEFAULT_ACCOUNT_ID);
+    loadAccountConversations(DEFAULT_ACCOUNT_ID);
+    setPendingAccessAction(null);
+    setShowAccessPrompt(true);
+  }, [loadAccountConversations]);
 
   const handleModelSelect = useCallback((model, patch = {}) => {
     setSettings((current) => ({
@@ -1472,6 +1536,8 @@ export default function App() {
       );
     } catch (error) {
       if (error.status === 401) {
+        clearSessionAccess();
+        setAccessToken("");
         setAccessVerified(false);
         setAccessDenied(true);
         promptForAccess({ type: "preview" });
@@ -1594,8 +1660,11 @@ export default function App() {
       } catch (error) {
         if (processingTimer) window.clearTimeout(processingTimer);
         if (error.status === 401) {
+          clearSessionAccess();
+          setAccessToken("");
           setAccessVerified(false);
           setAccessDenied(true);
+          setShowAccessPrompt(true);
         }
         updateActiveMessages((current) =>
           current.map((message) =>
@@ -1788,7 +1857,12 @@ export default function App() {
             <p>{mediaLocked ? `${QWEN_MODEL_LABEL} · Media request` : `${effectiveModelLabel} · ${usesQwenWorkflow ? "Multimodal" : "LLM"}`}</p>
           </div>
           <div className="chat-header-actions">
-            <StatusPill config={config} />
+            <StatusPill config={config} accessVerified={accessVerified} requiresAccessToken={requiresAccessToken} />
+            {requiresAccessToken ? (
+              <button type="button" className="icon-button ghost" onClick={handleChangeAccessKey} title="Change API key">
+                <KeyRound size={17} />
+              </button>
+            ) : null}
             <button type="button" className={classNames("pill-button", showAdvanced && "active")} onClick={() => setShowAdvanced((value) => !value)}>
               <Settings2 size={16} />
               Advanced
