@@ -3,9 +3,29 @@ import express from "express";
 import crypto from "node:crypto";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import multer from "multer";
 import { z } from "zod";
-import { buildLLMWorkflow, buildPromptFromMessages, DEFAULT_OPTIONS, LLM_MODELS, normalizeOptions } from "./workflow.js";
-import { cancelRun, createRun, getPublicConfig, normalizeRunResult, pollRun, retrieveRun } from "./floyo.js";
+import {
+  buildFloyoGPTWorkflow,
+  buildPromptFromMessages,
+  DEFAULT_OPTIONS,
+  getWorkflowSelection,
+  LLM_MODELS,
+  normalizeMedia,
+  QWEN_MODEL_ID,
+  QWEN_MODEL_LABEL,
+} from "./workflow.js";
+import {
+  cancelRun,
+  createRun,
+  getFileMetadata,
+  getPublicConfig,
+  normalizeRunResult,
+  pollRun,
+  retrieveRun,
+  uploadFileToFloyo,
+  validateFloyoApiKey,
+} from "./floyo.js";
 
 dotenv.config();
 
@@ -15,6 +35,13 @@ const projectRoot = path.resolve(__dirname, "..");
 
 const app = express();
 const port = Number(process.env.PORT || 8788);
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: {
+    files: 1,
+    fileSize: Number(process.env.MAX_UPLOAD_BYTES || 25 * 1024 * 1024),
+  },
+});
 
 app.disable("x-powered-by");
 app.use(express.json({ limit: "2mb" }));
@@ -73,7 +100,7 @@ function providedAccessToken(request) {
   return authorization.toLowerCase().startsWith("bearer ") ? authorization.slice(7).trim() : "";
 }
 
-async function resolveAccess(token) {
+async function resolveAccess(token, { validate = false } = {}) {
   const fingerprint = tokenFingerprint(token);
   const accountId = accountIdFromFingerprint(fingerprint);
 
@@ -88,17 +115,23 @@ async function resolveAccess(token) {
       };
     }
 
-    return {
+    const access = {
       ok: true,
       mode: "app",
       accountId,
       cached: false,
       floyoContext: {},
     };
+
+    if (validate) {
+      await validateFloyoApiKey(access.floyoContext);
+    }
+
+    return access;
   }
 
   if (tokenLooksLikeFloyoApiKey(token)) {
-    return {
+    const access = {
       ok: true,
       mode: tokenMatchesConfiguredFloyoApiKey(token) ? "configured_floyo_key" : "floyo_key",
       accountId,
@@ -107,6 +140,12 @@ async function resolveAccess(token) {
         apiKey: token,
       },
     };
+
+    if (validate) {
+      await validateFloyoApiKey(access.floyoContext);
+    }
+
+    return access;
   }
 
   return {
@@ -116,6 +155,50 @@ async function resolveAccess(token) {
     accountId,
     cached: false,
   };
+}
+
+function publicUploadMetadata(uploaded = {}, fallback = {}) {
+  const mimeType = String(uploaded.mime_type || uploaded.mimeType || fallback.mimeType || "").toLowerCase();
+  const inputPath = String(uploaded.input_path || uploaded.inputPath || "").trim();
+  const fileName = String(uploaded.file_name || uploaded.fileName || fallback.fileName || "").trim();
+  const kind = mimeType.startsWith("video/") ? "video" : mimeType.startsWith("image/") ? "image" : "file";
+
+  return {
+    id: uploaded.id,
+    fileName,
+    mimeType,
+    sizeBytes: uploaded.size_bytes || uploaded.sizeBytes || fallback.sizeBytes || 0,
+    inputPath,
+    url: uploaded.presigned_url || uploaded.presignedUrl || uploaded.url || undefined,
+    kind,
+  };
+}
+
+async function prepareMediaForWorkflow(media = [], floyoContext = {}) {
+  const normalizedMedia = normalizeMedia(media);
+  const prepared = [];
+
+  for (const item of normalizedMedia) {
+    if (item.kind !== "video" || item.url || !item.id) {
+      prepared.push(item);
+      continue;
+    }
+
+    const fileMetadata = await getFileMetadata(item.id, floyoContext);
+    prepared.push({
+      ...item,
+      url: fileMetadata.presigned_url || fileMetadata.presignedUrl || fileMetadata.url || "",
+    });
+  }
+
+  const missingVideoUrl = prepared.find((item) => item.kind === "video" && !item.url);
+  if (missingVideoUrl) {
+    const error = new Error("Video uploads need a Floyo presigned URL before they can be sent to Qwen.");
+    error.status = 400;
+    throw error;
+  }
+
+  return prepared;
 }
 
 async function requireAppAccess(request, response, next) {
@@ -154,6 +237,17 @@ const chatSchema = z.object({
       z.object({
         role: z.enum(["user", "assistant"]),
         content: z.string(),
+        attachments: z
+          .array(
+            z.object({
+              fileName: z.string().optional(),
+              file_name: z.string().optional(),
+              mimeType: z.string().optional(),
+              mime_type: z.string().optional(),
+              kind: z.string().optional(),
+            }),
+          )
+          .optional(),
       }),
     )
     .optional(),
@@ -164,11 +258,32 @@ const chatSchema = z.object({
       custom_model_name: z.string().optional(),
       systemPrompt: z.string().optional(),
       system_prompt: z.string().optional(),
-      temperature: z.number().optional(),
       reasoning: z.boolean().optional(),
+      temperature: z.number().optional(),
+      topP: z.number().optional(),
+      top_p: z.number().optional(),
+      enableThinking: z.boolean().optional(),
+      enable_thinking: z.boolean().optional(),
       maxTokens: z.number().optional(),
       max_tokens: z.number().optional(),
     })
+    .optional(),
+  media: z
+    .array(
+      z.object({
+        id: z.string().optional(),
+        inputPath: z.string().optional(),
+        input_path: z.string().optional(),
+        url: z.string().optional(),
+        presignedUrl: z.string().optional(),
+        presigned_url: z.string().optional(),
+        mimeType: z.string().optional(),
+        mime_type: z.string().optional(),
+        fileName: z.string().optional(),
+        file_name: z.string().optional(),
+        kind: z.enum(["image", "video", "file"]).optional(),
+      }),
+    )
     .optional(),
   waitForCompletion: z.boolean().optional(),
   pollTimeoutMs: z.number().int().min(10000).max(900000).optional(),
@@ -177,9 +292,16 @@ const chatSchema = z.object({
 app.get("/api/config", (_request, response) => {
   response.json({
     ...getPublicConfig(),
-    requiresAccessToken: Boolean(expectedAccessToken() || process.env.VERCEL || process.env.NODE_ENV === "production"),
+    requiresAccessToken: Boolean(
+      expectedAccessToken() || process.env.VERCEL || process.env.NODE_ENV === "production" || !configuredFloyoApiKey(),
+    ),
     defaults: DEFAULT_OPTIONS,
     models: LLM_MODELS,
+    qwenModel: {
+      id: QWEN_MODEL_ID,
+      label: QWEN_MODEL_LABEL,
+    },
+    defaultModel: DEFAULT_OPTIONS.model,
   });
 });
 
@@ -194,7 +316,7 @@ app.post("/api/access/verify", async (request, response, next) => {
       return;
     }
 
-    const access = await resolveAccess(token);
+    const access = await resolveAccess(token, { validate: true });
     if (access.ok) {
       response.json({
         ok: true,
@@ -210,18 +332,76 @@ app.post("/api/access/verify", async (request, response, next) => {
       message: access.message,
     });
   } catch (error) {
+    if (error.status === 401 || error.status === 403) {
+      response.status(401).json({
+        error: "Unauthorized",
+        message: "Invalid Floyo API key or app access token.",
+      });
+      return;
+    }
     next(error);
   }
 });
 
-app.post("/api/workflow/preview", requireAppAccess, (request, response, next) => {
+app.post("/api/files/upload", requireAppAccess, upload.single("file"), async (request, response, next) => {
+  try {
+    if (!request.file) {
+      response.status(400).json({
+        error: "Bad Request",
+        message: "A file is required.",
+      });
+      return;
+    }
+
+    const mimeType = request.file.mimetype || "application/octet-stream";
+    const isSupportedMedia = mimeType.startsWith("image/") || mimeType.startsWith("video/");
+    if (!isSupportedMedia) {
+      response.status(400).json({
+        error: "Unsupported file type",
+        message: "Upload an image or video file.",
+      });
+      return;
+    }
+
+    const formData = new FormData();
+    const fileName = String(request.body?.filename || request.file.originalname || "upload").trim();
+    formData.append("file", new Blob([request.file.buffer], { type: mimeType }), fileName);
+    formData.append("path", String(request.body?.path || "/api/uploads"));
+    formData.append("filename", fileName);
+    formData.append("on_conflict", String(request.body?.on_conflict || "rename"));
+
+    const uploaded = await uploadFileToFloyo(formData, request.floyoContext || {});
+    response.json({
+      ok: true,
+      file: publicUploadMetadata(uploaded, {
+        fileName,
+        mimeType,
+        sizeBytes: request.file.size,
+      }),
+      raw: uploaded,
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/workflow/preview", requireAppAccess, async (request, response, next) => {
   try {
     const parsed = chatSchema.partial({ prompt: true }).parse({
       ...request.body,
-      prompt: request.body?.prompt || "Write a concise launch plan for Floyo API integrations.",
+      prompt: request.body?.prompt || "Describe the uploaded media.",
     });
     const prompt = buildPromptFromMessages(parsed.messages, parsed.prompt);
-    response.json(buildLLMWorkflow({ prompt, options: normalizeOptions(parsed.options) }));
+    const media = await prepareMediaForWorkflow(parsed.media, request.floyoContext || {});
+    const workflowPayload = buildFloyoGPTWorkflow({
+      prompt,
+      options: parsed.options,
+      media,
+    });
+    response.json({
+      ...workflowPayload,
+      selection: getWorkflowSelection({ options: parsed.options, media }),
+    });
   } catch (error) {
     next(error);
   }
@@ -231,12 +411,15 @@ app.post("/api/chat", requireAppAccess, async (request, response, next) => {
   try {
     const parsed = chatSchema.parse(request.body);
     const prompt = buildPromptFromMessages(parsed.messages, parsed.prompt);
-    const workflowPayload = buildLLMWorkflow({
+    const floyoContext = request.floyoContext || {};
+    const media = await prepareMediaForWorkflow(parsed.media, floyoContext);
+    const selection = getWorkflowSelection({ options: parsed.options, media });
+    const workflowPayload = buildFloyoGPTWorkflow({
       prompt,
-      options: normalizeOptions(parsed.options),
+      options: parsed.options,
+      media,
     });
 
-    const floyoContext = request.floyoContext || {};
     const run = await createRun(workflowPayload, floyoContext);
     const shouldWait = parsed.waitForCompletion ?? true;
     const finalRun = shouldWait
@@ -247,6 +430,10 @@ app.post("/api/chat", requireAppAccess, async (request, response, next) => {
     response.json({
       runId: run.id,
       workflow: workflowPayload,
+      workflowType: selection.type,
+      model: selection.model,
+      modelLabel: selection.modelLabel,
+      lockedByMedia: selection.lockedByMedia,
       ...normalizedResult,
     });
   } catch (error) {
@@ -285,6 +472,14 @@ if (process.env.NODE_ENV === "production") {
 }
 
 app.use((error, _request, response, _next) => {
+  if (error instanceof multer.MulterError) {
+    response.status(400).json({
+      error: error.name,
+      message: error.code === "LIMIT_FILE_SIZE" ? "The uploaded file is too large." : error.message,
+    });
+    return;
+  }
+
   const status = error.status || (error.name === "ZodError" ? 400 : 500);
   response.status(status).json({
     error: error.name || "Error",
@@ -295,7 +490,7 @@ app.use((error, _request, response, _next) => {
 
 if (!process.env.VERCEL) {
   app.listen(port, () => {
-    console.log(`Floyo LLM Codex server listening on http://localhost:${port}`);
+    console.log(`FloyoGPT Qwen server listening on http://localhost:${port}`);
   });
 }
 

@@ -5,8 +5,16 @@ function envApiBaseUrl() {
   return (process.env.FLOYO_API_BASE_URL || "https://api.floyo.ai").replace(/\/+$/, "");
 }
 
+function envCdnBaseUrl() {
+  return (process.env.FLOYO_CDN_URL || process.env.CDN_URL || "https://cdn.floyo.ai").replace(/\/+$/, "");
+}
+
 function normalizeApiBaseUrl(apiBaseUrl = "") {
   return (apiBaseUrl || envApiBaseUrl()).replace(/\/+$/, "");
+}
+
+function normalizeCdnBaseUrl(cdnBaseUrl = "") {
+  return (cdnBaseUrl || envCdnBaseUrl()).replace(/\/+$/, "");
 }
 
 function authHeaders(apiKeyOverride = "") {
@@ -25,6 +33,10 @@ function authHeaders(apiKeyOverride = "") {
 
 function candidateApiBaseUrls() {
   return [...new Set([envApiBaseUrl(), "https://api.floyo.ai", "https://api-dev.floyo.ai"].map(normalizeApiBaseUrl))];
+}
+
+function candidateCdnBaseUrls() {
+  return [...new Set([envCdnBaseUrl(), "https://cdn.floyo.ai"].map(normalizeCdnBaseUrl))];
 }
 
 async function parseResponse(response) {
@@ -61,6 +73,13 @@ function requestBaseUrls(context = {}) {
   return [envApiBaseUrl()];
 }
 
+function requestCdnBaseUrls(context = {}) {
+  if (context.cdnBaseUrl) {
+    return [normalizeCdnBaseUrl(context.cdnBaseUrl)];
+  }
+  return candidateCdnBaseUrls();
+}
+
 async function floyoRequest(path, options = {}, context = {}) {
   let lastAuthError = null;
 
@@ -92,6 +111,51 @@ async function floyoRequest(path, options = {}, context = {}) {
   throw lastAuthError || new Error("Floyo API request failed.");
 }
 
+export async function uploadFileToFloyo(formData, context = {}) {
+  let lastAuthError = null;
+
+  for (const cdnBaseUrl of requestCdnBaseUrls(context)) {
+    const response = await fetch(`${cdnBaseUrl}/upload`, {
+      method: "POST",
+      headers: {
+        ...authHeaders(context.apiKey),
+      },
+      body: formData,
+    });
+    const data = await parseResponse(response);
+
+    if (response.ok) {
+      context.cdnBaseUrl = cdnBaseUrl;
+      return data;
+    }
+
+    const error = buildFloyoError(response, data);
+    if (context.apiKey && !context.cdnBaseUrl && isInvalidApiKeyResponse(error)) {
+      lastAuthError = error;
+      continue;
+    }
+
+    throw error;
+  }
+
+  throw lastAuthError || new Error("Floyo file upload failed.");
+}
+
+export async function validateFloyoApiKey(context = {}) {
+  const formData = new FormData();
+  const filename = `floyo-key-check-${Date.now()}-${Math.random().toString(16).slice(2)}.txt`;
+  formData.append("file", new Blob(["ok"], { type: "text/plain" }), filename);
+  formData.append("path", "/api/key-checks");
+  formData.append("filename", filename);
+  formData.append("on_conflict", "rename");
+  const uploaded = await uploadFileToFloyo(formData, context);
+  return {
+    ok: true,
+    file: uploaded,
+    cdnBaseUrl: context.cdnBaseUrl,
+  };
+}
+
 function getResponseMessage(data) {
   if (typeof data === "object" && data) {
     return String(data.message || data.error || JSON.stringify(data));
@@ -110,6 +174,10 @@ export async function retrieveRun(runId, { expandOutputs = true, presignedUrlExp
   void expandOutputs;
   void presignedUrlExpiresIn;
   return floyoRequest(`/runs/${encodeURIComponent(runId)}`, {}, { apiKey, apiBaseUrl });
+}
+
+export async function getFileMetadata(fileId, context = {}) {
+  return floyoRequest(`/files/${encodeURIComponent(fileId)}?expand=presigned_url`, {}, context);
 }
 
 export async function cancelRun(runId, context = {}) {
@@ -221,6 +289,19 @@ function extractStructuredText(run) {
   return "";
 }
 
+function extractRunErrorText(run) {
+  const error = run?.error;
+  if (!error) {
+    return "";
+  }
+
+  if (typeof error === "string") {
+    return error.trim();
+  }
+
+  return getValueByPossibleKeys(error, ["message", "error", "type"]);
+}
+
 export async function normalizeRunResult(run, context = {}) {
   const outputs = Array.isArray(run?.outputs) ? run.outputs : [];
   const outputTexts = [];
@@ -242,6 +323,7 @@ export async function normalizeRunResult(run, context = {}) {
     outputTexts[0] ||
     extractPreviewText(run) ||
     extractStructuredText(run) ||
+    extractRunErrorText(run) ||
     (run?.status === "done"
       ? "Run completed, but Floyo did not expose a text field in the run response. Check raw run data and outputs."
       : "");
@@ -257,5 +339,6 @@ export async function normalizeRunResult(run, context = {}) {
 export function getPublicConfig() {
   return {
     hasApiKey: Boolean(process.env.FLOYO_API_KEY && process.env.FLOYO_API_KEY !== "YOUR_FLOYO_API_KEY"),
+    hasCdn: Boolean(envCdnBaseUrl()),
   };
 }

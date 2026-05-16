@@ -11,14 +11,16 @@ import {
   Copy,
   Cpu,
   FileJson,
+  Film,
   FolderOpen,
+  Image as ImageIcon,
   LibraryBig,
   Loader2,
   MessageSquarePlus,
   Mic,
   PanelLeft,
+  Paperclip,
   Pencil,
-  Plus,
   RotateCcw,
   Search,
   Send,
@@ -44,6 +46,8 @@ const FLOYO_ACCESS_INSTRUCTIONS_URL =
   "https://shared.archbee.space/public/PREVIEW-WejOAlhAmyJ3PP37IK_LR/PREVIEW-eANCv0feHV1nQbGY0KMmo";
 const LEGACY_DEFAULT_SYSTEM_PROMPT =
   "You are Floyo Codex, a precise coding and multimodal assistant. Answer directly, keep code runnable, and mention assumptions when needed.";
+const QWEN_MODEL_ID = "alibaba/qwen3.5-plus-multimodal";
+const QWEN_MODEL_LABEL = "Alibaba Qwen3.5 Plus";
 
 const FALLBACK_MODELS = [
   "anthropic/claude-opus-4.6",
@@ -58,9 +62,11 @@ const DEFAULT_SETTINGS = {
   model: "anthropic/claude-opus-4.6",
   customModelName: "",
   systemPrompt:
-    "You are Floyo LLM, a precise coding and writing assistant. Answer in clean Markdown. Put runnable code in fenced code blocks with the correct language label.",
+    "You are FloyoGPT, a precise multimodal assistant. Answer in clean Markdown. Put runnable code in fenced code blocks with the correct language label.",
   temperature: 1,
   reasoning: true,
+  topP: 0.8,
+  enableThinking: true,
   maxTokens: 0,
 };
 
@@ -71,8 +77,9 @@ const PRESETS = [
     icon: Code2,
     patch: {
       systemPrompt:
-        "You are Floyo LLM, a senior software engineering assistant. Give concrete implementation-ready answers in clean Markdown. Put every code snippet in fenced code blocks with the correct language label.",
+        "You are FloyoGPT, a senior software engineering assistant. Give concrete implementation-ready answers in clean Markdown. Put every code snippet in fenced code blocks with the correct language label.",
       reasoning: true,
+      enableThinking: true,
       temperature: 0.7,
     },
   },
@@ -82,8 +89,9 @@ const PRESETS = [
     icon: Sparkles,
     patch: {
       systemPrompt:
-        "You are Floyo LLM, a careful reasoning assistant. Think through complex tasks, make assumptions explicit, and answer in clean Markdown.",
+        "You are FloyoGPT, a careful reasoning assistant. Think through complex tasks, make assumptions explicit, and answer in clean Markdown.",
       reasoning: true,
+      enableThinking: true,
       temperature: 0.4,
     },
   },
@@ -92,8 +100,9 @@ const PRESETS = [
     label: "Creative",
     icon: MessageSquarePlus,
     patch: {
-      systemPrompt: "You are Floyo LLM, a creative writing assistant. Give polished, structured, useful responses in clean Markdown.",
+      systemPrompt: "You are FloyoGPT, a creative writing assistant. Give polished, structured, useful responses in clean Markdown.",
       reasoning: false,
+      enableThinking: false,
       temperature: 1.2,
     },
   },
@@ -104,6 +113,7 @@ const PRESETS = [
     patch: {
       systemPrompt: "Return only valid JSON. Do not include markdown fences, comments, or extra prose.",
       reasoning: false,
+      enableThinking: false,
       temperature: 0,
     },
   },
@@ -135,6 +145,12 @@ const FEATURED_MODEL_OPTIONS = [
     description: "Balanced default",
   },
   {
+    label: "Qwen Vision",
+    model: QWEN_MODEL_ID,
+    description: "Text, image, and video",
+    enableThinking: true,
+  },
+  {
     label: "Thinking",
     model: "anthropic/claude-opus-4.6",
     description: "Reasoning on",
@@ -160,7 +176,7 @@ function createSeedMessage() {
   return {
     id: "seed",
     role: "assistant",
-    content: "Floyo LLM ready.",
+    content: "FloyoGPT ready.",
     createdAt: Date.now(),
   };
 }
@@ -183,6 +199,9 @@ function cleanTitle(value) {
 }
 
 function modelDisplayName(model) {
+  if (model === QWEN_MODEL_ID) {
+    return QWEN_MODEL_LABEL;
+  }
   if (model === "Custom") {
     return "Custom";
   }
@@ -207,14 +226,17 @@ function normalizeSavedSettings(saved) {
     !saved?.systemPrompt || saved.systemPrompt === LEGACY_DEFAULT_SYSTEM_PROMPT
       ? DEFAULT_SETTINGS.systemPrompt
       : saved.systemPrompt;
+  const model = saved?.model && saved.model !== "undefined" ? saved.model : DEFAULT_SETTINGS.model;
   return {
     ...DEFAULT_SETTINGS,
     ...(saved || {}),
+    model,
     systemPrompt,
+    topP: Number.isFinite(Number(saved?.topP ?? saved?.top_p)) ? Number(saved.topP ?? saved.top_p) : DEFAULT_SETTINGS.topP,
+    enableThinking: Boolean(saved?.enableThinking ?? saved?.enable_thinking ?? saved?.reasoning ?? DEFAULT_SETTINGS.enableThinking),
+    reasoning: Boolean(saved?.reasoning ?? saved?.enableThinking ?? DEFAULT_SETTINGS.reasoning),
     imagePaths: undefined,
     inputVideoUrl: undefined,
-    enableThinking: undefined,
-    topP: undefined,
   };
 }
 
@@ -283,10 +305,11 @@ function readInitialAccessState() {
 }
 
 async function apiRequest(path, options = {}, accessToken = "") {
+  const isFormData = typeof FormData !== "undefined" && options.body instanceof FormData;
   const response = await fetch(path, {
     ...options,
     headers: {
-      "Content-Type": "application/json",
+      ...(isFormData ? {} : { "Content-Type": "application/json" }),
       ...(accessToken ? { "X-Floyo-App-Token": accessToken } : {}),
       ...(options.headers || {}),
     },
@@ -304,6 +327,48 @@ async function apiRequest(path, options = {}, accessToken = "") {
 
 function copyText(value) {
   return navigator.clipboard.writeText(value);
+}
+
+function formatFileSize(bytes = 0) {
+  const size = Number(bytes) || 0;
+  if (size < 1024) return `${size} B`;
+  if (size < 1024 * 1024) return `${(size / 1024).toFixed(1)} KB`;
+  return `${(size / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function mediaKindFromMime(mimeType = "") {
+  if (mimeType.startsWith("image/")) return "image";
+  if (mimeType.startsWith("video/")) return "video";
+  return "file";
+}
+
+function createPendingAttachment(file) {
+  const kind = mediaKindFromMime(file.type);
+  return {
+    id: crypto.randomUUID(),
+    file,
+    fileName: file.name,
+    mimeType: file.type || "application/octet-stream",
+    sizeBytes: file.size,
+    kind,
+    previewUrl: kind === "image" || kind === "video" ? URL.createObjectURL(file) : "",
+    status: "ready",
+  };
+}
+
+function serializeAttachment(attachment, patch = {}) {
+  return {
+    id: attachment.id,
+    fileName: attachment.fileName,
+    mimeType: attachment.mimeType,
+    sizeBytes: attachment.sizeBytes,
+    kind: attachment.kind,
+    previewUrl: attachment.previewUrl,
+    status: attachment.status,
+    inputPath: attachment.inputPath,
+    url: attachment.url,
+    ...patch,
+  };
 }
 
 function sleep(ms) {
@@ -341,7 +406,7 @@ function AccessGate({ accessToken, accessDenied, isCheckingAccess, onVerifyAcces
         </div>
         <h2>FloyoGPT access</h2>
         <p>
-          Enter a valid Floyo API key or app access token to continue this request. Generate a Floyo API key from the Floyo panel.{" "}
+          Enter a valid Floyo API key or app access token to continue this request. The key is checked with a tiny secure Floyo upload before the request runs.{" "}
           <a href={FLOYO_ACCESS_INSTRUCTIONS_URL} target="_blank" rel="noreferrer">
             Setup instructions
           </a>
@@ -369,20 +434,24 @@ function AccessGate({ accessToken, accessDenied, isCheckingAccess, onVerifyAcces
 
 function RunProgress({ phase = "thinking" }) {
   const labels = {
+    uploading: {
+      title: "Uploading",
+      detail: "Securely uploading media to Floyo inputs.",
+    },
     thinking: {
       title: "Thinking",
-      detail: "The selected LLM is reading the context and planning the answer.",
+      detail: "The selected model is reading the context and planning the answer.",
     },
     processing: {
       title: "Running workflow",
-      detail: "Floyo is executing the LLM node through the API.",
+      detail: "Floyo is executing the selected workflow through the API.",
     },
     writing: {
       title: "Writing",
       detail: "Formatting the final response for the chat.",
     },
   };
-  const orderedSteps = ["thinking", "processing", "writing"];
+  const orderedSteps = ["uploading", "thinking", "processing", "writing"];
   const activeIndex = Math.max(0, orderedSteps.indexOf(phase));
   const state = labels[phase] || labels.thinking;
 
@@ -521,6 +590,42 @@ function MarkdownContent({ content, onCopy }) {
   );
 }
 
+function AttachmentList({ attachments = [], onRemove }) {
+  if (!attachments.length) {
+    return null;
+  }
+
+  return (
+    <div className="attachment-list">
+      {attachments.map((attachment) => {
+        const isImage = attachment.kind === "image";
+        const isVideo = attachment.kind === "video";
+        return (
+          <div key={attachment.id || attachment.inputPath || attachment.fileName} className="attachment-chip">
+            <div className="attachment-preview">
+              {isImage && attachment.previewUrl ? <img src={attachment.previewUrl} alt="" /> : null}
+              {isVideo && attachment.previewUrl ? <video src={attachment.previewUrl} muted playsInline /> : null}
+              {!attachment.previewUrl ? isVideo ? <Film size={17} /> : <ImageIcon size={17} /> : null}
+            </div>
+            <div className="attachment-info">
+              <strong>{attachment.fileName || "Uploaded media"}</strong>
+              <span>
+                {attachment.kind || "file"} · {formatFileSize(attachment.sizeBytes)}
+                {attachment.status ? ` · ${attachment.status}` : ""}
+              </span>
+            </div>
+            {onRemove ? (
+              <button type="button" className="icon-button ghost attachment-remove" onClick={() => onRemove(attachment.id)} title="Remove file">
+                <X size={14} />
+              </button>
+            ) : null}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
 function Message({
   message,
   onCopy,
@@ -542,7 +647,7 @@ function Message({
       </div>
       <div className={classNames("message-body", isEditing && "editing")}>
         <div className="message-meta">
-          <span>{isAssistant ? "Floyo LLM" : "You"}</span>
+          <span>{isAssistant ? "FloyoGPT" : "You"}</span>
           {message.status ? <span className={`run-status ${message.status}`}>{message.status}</span> : null}
           {message.runId ? <span className="run-id">{message.runId}</span> : null}
           {message.loading ? <Loader2 className="spin" size={15} /> : null}
@@ -576,7 +681,10 @@ function Message({
         ) : isAssistant ? (
           <MarkdownContent content={message.content} onCopy={onCopy} />
         ) : (
-          <pre className="message-content">{message.content}</pre>
+          <>
+            <pre className="message-content">{message.content}</pre>
+            <AttachmentList attachments={message.attachments || []} />
+          </>
         )}
         {Array.isArray(message.outputs) && message.outputs.length > 0 ? (
           <div className="output-list">
@@ -638,13 +746,16 @@ function SliderField({ label, value, min, max, step, onChange }) {
   );
 }
 
-function ModelPicker({ settings, modelOptions, onModelSelect, onToggleReasoning }) {
+function ModelPicker({ settings, modelOptions, effectiveModel, mediaLocked, onModelSelect, onToggleReasoning }) {
   const [open, setOpen] = useState(false);
   const pickerRef = useRef(null);
-  const availableModels = uniqueModels(modelOptions);
-  const featuredOptions = FEATURED_MODEL_OPTIONS.filter((option) => availableModels.includes(option.model));
+  const availableModels = uniqueModels([...(modelOptions || []), QWEN_MODEL_ID]);
+  const visibleModels = mediaLocked ? [QWEN_MODEL_ID] : availableModels;
+  const featuredOptions = FEATURED_MODEL_OPTIONS.filter((option) => visibleModels.includes(option.model));
   const featuredModels = new Set(featuredOptions.map((option) => option.model));
-  const remainingModels = availableModels.filter((model) => !featuredModels.has(model));
+  const remainingModels = visibleModels.filter((model) => !featuredModels.has(model));
+  const isQwenEffective = effectiveModel === QWEN_MODEL_ID;
+  const thinkingEnabled = isQwenEffective ? settings.enableThinking : settings.reasoning;
 
   useEffect(() => {
     if (!open) {
@@ -662,7 +773,9 @@ function ModelPicker({ settings, modelOptions, onModelSelect, onToggleReasoning 
   }, [open]);
 
   const selectModel = (model, patch = {}) => {
-    onModelSelect(model, patch);
+    if (!mediaLocked || model === QWEN_MODEL_ID) {
+      onModelSelect(model, patch);
+    }
     setOpen(false);
   };
 
@@ -670,27 +783,33 @@ function ModelPicker({ settings, modelOptions, onModelSelect, onToggleReasoning 
     <div className="model-picker" ref={pickerRef}>
       <button
         type="button"
-        className="model-trigger"
+        className={classNames("model-trigger", mediaLocked && "locked")}
         aria-haspopup="listbox"
         aria-expanded={open}
         onClick={() => setOpen((value) => !value)}
       >
-        <span>{modelDisplayName(settings.model === "Custom" ? settings.customModelName || "Custom" : settings.model)}</span>
+        <span>{modelDisplayName(effectiveModel === "Custom" ? settings.customModelName || "Custom" : effectiveModel)}</span>
         <ChevronDown size={15} />
       </button>
 
       {open ? (
         <div className="model-menu" role="listbox">
-          <div className="model-menu-section-label">Latest</div>
+          {mediaLocked ? <div className="model-lock-note">Media attached. Qwen multimodal is required for this request.</div> : null}
+          <div className="model-menu-section-label">{mediaLocked ? "Multimodal model" : "Latest"}</div>
           <div className="model-menu-list">
             {featuredOptions.map((option) => {
-              const active = settings.model === option.model;
+              const active = effectiveModel === option.model;
               return (
                 <button
                   key={`${option.label}-${option.model}`}
                   type="button"
                   className={classNames("model-option", active && "active")}
-                  onClick={() => selectModel(option.model, option.reasoning === undefined ? {} : { reasoning: option.reasoning })}
+                  onClick={() =>
+                    selectModel(option.model, {
+                      ...(option.reasoning === undefined ? {} : { reasoning: option.reasoning }),
+                      ...(option.enableThinking === undefined ? {} : { enableThinking: option.enableThinking }),
+                    })
+                  }
                   role="option"
                   aria-selected={active}
                 >
@@ -704,37 +823,41 @@ function ModelPicker({ settings, modelOptions, onModelSelect, onToggleReasoning 
             })}
           </div>
 
-          <div className="model-menu-divider" />
-          <div className="model-menu-section-label">All Floyo models</div>
-          <div className="model-menu-list compact">
-            {remainingModels.map((model) => {
-              const active = settings.model === model;
-              return (
-                <button
-                  key={model}
-                  type="button"
-                  className={classNames("model-option", active && "active")}
-                  onClick={() => selectModel(model)}
-                  role="option"
-                  aria-selected={active}
-                >
-                  <span>
-                    <strong>{modelDisplayName(model)}</strong>
-                    <small>{model}</small>
-                  </span>
-                  {active ? <Check size={18} /> : null}
-                </button>
-              );
-            })}
-          </div>
+          {remainingModels.length ? (
+            <>
+              <div className="model-menu-divider" />
+              <div className="model-menu-section-label">All Floyo models</div>
+              <div className="model-menu-list compact">
+                {remainingModels.map((model) => {
+                  const active = effectiveModel === model;
+                  return (
+                    <button
+                      key={model}
+                      type="button"
+                      className={classNames("model-option", active && "active")}
+                      onClick={() => selectModel(model)}
+                      role="option"
+                      aria-selected={active}
+                    >
+                      <span>
+                        <strong>{modelDisplayName(model)}</strong>
+                        <small>{model}</small>
+                      </span>
+                      {active ? <Check size={18} /> : null}
+                    </button>
+                  );
+                })}
+              </div>
+            </>
+          ) : null}
 
           <div className="model-menu-divider" />
           <button type="button" className="model-option reasoning-option" onClick={onToggleReasoning}>
             <span>
-              <strong>Reasoning</strong>
-              <small>{settings.reasoning ? "On for deeper answers" : "Off for faster answers"}</small>
+              <strong>{isQwenEffective ? "Thinking" : "Reasoning"}</strong>
+              <small>{thinkingEnabled ? "On for deeper answers" : "Off for faster answers"}</small>
             </span>
-            <span className={classNames("reasoning-switch", settings.reasoning && "on")}>
+            <span className={classNames("reasoning-switch", thinkingEnabled && "on")}>
               <i />
             </span>
           </button>
@@ -813,6 +936,8 @@ function AdvancedPanel({
   setActivePreset,
   config,
   models,
+  effectiveModel,
+  mediaLocked,
   workflowPreview,
   lastRun,
   onPreviewWorkflow,
@@ -827,14 +952,14 @@ function AdvancedPanel({
   );
   const payload = workflowPreview || lastRun?.workflow || null;
   const json = payload ? JSON.stringify(payload, null, 2) : "";
-  const modelOptions = models?.length ? models : FALLBACK_MODELS;
-
+  const modelOptions = uniqueModels([...(models?.length ? models : FALLBACK_MODELS), QWEN_MODEL_ID]);
+  const usesQwen = effectiveModel === QWEN_MODEL_ID;
   return (
     <aside className="advanced-panel">
       <div className="panel-head">
         <div>
           <h2>Advanced</h2>
-          <p>{config?.hasApiKey ? "Server-side Floyo API" : "API key missing"}</p>
+          <p>{config?.hasApiKey ? "Secure Floyo API" : "API key required"}</p>
         </div>
         <button type="button" className="icon-button" onClick={onClose} title="Close advanced settings">
           <X size={16} />
@@ -846,27 +971,39 @@ function AdvancedPanel({
           <Settings2 size={15} />
           Model
         </div>
-        <label className="field compact">
-          <span>Model selection</span>
-          <select value={settings.model} onChange={(event) => update({ model: event.target.value })}>
-            {modelOptions.map((model) => (
-              <option key={model} value={model}>
-                {model}
-              </option>
-            ))}
-          </select>
-        </label>
-        {settings.model === "Custom" ? (
-          <label className="field compact">
-            <span>Custom model name</span>
-            <input
-              type="text"
-              placeholder="provider/model-name"
-              value={settings.customModelName}
-              onChange={(event) => update({ customModelName: event.target.value })}
-            />
-          </label>
-        ) : null}
+        {mediaLocked ? (
+          <div className="fixed-model-card locked">
+            <Sparkles size={17} />
+            <div>
+              <strong>{QWEN_MODEL_LABEL}</strong>
+              <span>Media is attached, so Qwen multimodal is required.</span>
+            </div>
+          </div>
+        ) : (
+          <>
+            <label className="field compact">
+              <span>Model selection</span>
+              <select value={settings.model} onChange={(event) => update({ model: event.target.value })}>
+                {modelOptions.map((model) => (
+                  <option key={model} value={model}>
+                    {model === QWEN_MODEL_ID ? QWEN_MODEL_LABEL : model}
+                  </option>
+                ))}
+              </select>
+            </label>
+            {settings.model === "Custom" ? (
+              <label className="field compact">
+                <span>Custom model name</span>
+                <input
+                  type="text"
+                  placeholder="provider/model-name"
+                  value={settings.customModelName}
+                  onChange={(event) => update({ customModelName: event.target.value })}
+                />
+              </label>
+            ) : null}
+          </>
+        )}
       </div>
 
       <div className="panel-section">
@@ -901,6 +1038,7 @@ function AdvancedPanel({
           Node settings
         </div>
         <SliderField label="Temperature" value={settings.temperature} min={0} max={2} step={0.1} onChange={(temperature) => update({ temperature })} />
+        {usesQwen ? <SliderField label="Top P" value={settings.topP} min={0} max={1} step={0.05} onChange={(topP) => update({ topP })} /> : null}
         <label className="field compact">
           <span>Max tokens</span>
           <input
@@ -915,10 +1053,10 @@ function AdvancedPanel({
         <label className="toggle-row">
           <input
             type="checkbox"
-            checked={settings.reasoning}
-            onChange={(event) => update({ reasoning: event.target.checked })}
+            checked={usesQwen ? settings.enableThinking : settings.reasoning}
+            onChange={(event) => update(usesQwen ? { enableThinking: event.target.checked } : { reasoning: event.target.checked })}
           />
-          <span>Reasoning</span>
+          <span>{usesQwen ? "Thinking" : "Reasoning"}</span>
         </label>
       </div>
 
@@ -977,9 +1115,11 @@ export default function App() {
   const [isCheckingAccess, setIsCheckingAccess] = useState(false);
   const [showAccessPrompt, setShowAccessPrompt] = useState(false);
   const [pendingAccessAction, setPendingAccessAction] = useState(null);
+  const [pendingAttachments, setPendingAttachments] = useState([]);
+  const [isDraggingFiles, setIsDraggingFiles] = useState(false);
   const scrollRef = useRef(null);
   const inputRef = useRef(null);
-  const modelOptions = models?.length ? models : FALLBACK_MODELS;
+  const fileInputRef = useRef(null);
 
   const activeConversation = useMemo(
     () => conversations.find((conversation) => conversation.id === activeConversationId) || conversations[0],
@@ -993,14 +1133,18 @@ export default function App() {
   const isEmptyChat = visibleMessages.length === 0;
   const requiresAccessToken = Boolean(config?.requiresAccessToken);
   const isAccessLocked = requiresAccessToken && !accessVerified;
+  const modelOptions = useMemo(() => uniqueModels([...(models?.length ? models : FALLBACK_MODELS), QWEN_MODEL_ID]), [models]);
+  const mediaLocked = pendingAttachments.length > 0;
+  const effectiveModel = mediaLocked ? QWEN_MODEL_ID : settings.model || DEFAULT_SETTINGS.model;
+  const usesQwenWorkflow = effectiveModel === QWEN_MODEL_ID;
+  const effectiveModelLabel = modelDisplayName(effectiveModel === "Custom" ? settings.customModelName || "Custom" : effectiveModel);
 
   useEffect(() => {
     apiRequest("/api/config")
       .then((nextConfig) => {
         setConfig(nextConfig);
-        if (Array.isArray(nextConfig.models) && nextConfig.models.length) {
-          setModels(nextConfig.models);
-        }
+        const serverModels = Array.isArray(nextConfig.models) && nextConfig.models.length ? nextConfig.models : FALLBACK_MODELS;
+        setModels(uniqueModels([...serverModels, nextConfig.qwenModel?.id || QWEN_MODEL_ID]));
         if (nextConfig.defaults) {
           setSettings((current) => ({ ...nextConfig.defaults, ...current }));
         }
@@ -1074,6 +1218,9 @@ export default function App() {
       setAccessDenied(false);
       return undefined;
     }
+    if (accessVerified) {
+      return undefined;
+    }
     if (!accessToken.trim()) {
       setAccessVerified(false);
       return undefined;
@@ -1116,7 +1263,7 @@ export default function App() {
     return () => {
       isCancelled = true;
     };
-  }, [accessAccountId, accessToken, config, loadAccountConversations, requiresAccessToken]);
+  }, [accessAccountId, accessToken, accessVerified, config, loadAccountConversations, requiresAccessToken]);
 
   useEffect(() => {
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: "smooth" });
@@ -1124,14 +1271,16 @@ export default function App() {
 
   const requestSettings = useMemo(
     () => ({
-      model: settings.model,
+      model: effectiveModel,
       customModelName: settings.customModelName,
       systemPrompt: settings.systemPrompt,
       temperature: settings.temperature,
+      topP: settings.topP,
       reasoning: settings.reasoning,
+      enableThinking: settings.enableThinking,
       maxTokens: settings.maxTokens,
     }),
-    [settings],
+    [effectiveModel, settings],
   );
 
   const showNotice = useCallback((value) => {
@@ -1153,16 +1302,23 @@ export default function App() {
     setShowAccessPrompt(true);
   }, []);
 
-  const updateModelSelection = useCallback((model, patch = {}) => {
-    setSettings((current) => ({ ...current, ...patch, model }));
-    if (model === "Custom") {
-      setShowAdvanced(true);
-    }
+  const handleModelSelect = useCallback((model, patch = {}) => {
+    setSettings((current) => ({
+      ...current,
+      ...patch,
+      model,
+    }));
   }, []);
 
-  const toggleReasoning = useCallback(() => {
-    setSettings((current) => ({ ...current, reasoning: !current.reasoning }));
-  }, []);
+  const toggleThinking = useCallback(() => {
+    setSettings((current) => {
+      const currentEffectiveModel = pendingAttachments.length > 0 ? QWEN_MODEL_ID : current.model || DEFAULT_SETTINGS.model;
+      if (currentEffectiveModel === QWEN_MODEL_ID) {
+        return { ...current, enableThinking: !current.enableThinking };
+      }
+      return { ...current, reasoning: !current.reasoning };
+    });
+  }, [pendingAttachments.length]);
 
   const updateActiveMessages = useCallback(
     (updater, titleSource = "") => {
@@ -1190,6 +1346,10 @@ export default function App() {
     setConversations((current) => [conversation, ...current].slice(0, 24));
     setActiveConversationId(conversation.id);
     setDraft("");
+    setPendingAttachments((current) => {
+      current.forEach((attachment) => attachment.previewUrl && URL.revokeObjectURL(attachment.previewUrl));
+      return [];
+    });
     setEditingMessageId("");
     setEditingText("");
     setLastRun(null);
@@ -1218,23 +1378,83 @@ export default function App() {
   const resetCurrentChat = useCallback(() => {
     updateActiveMessages([createSeedMessage()]);
     setDraft("");
+    setPendingAttachments((current) => {
+      current.forEach((attachment) => attachment.previewUrl && URL.revokeObjectURL(attachment.previewUrl));
+      return [];
+    });
     setEditingMessageId("");
     setEditingText("");
     setLastRun(null);
     setWorkflowPreview(null);
   }, [updateActiveMessages]);
 
+  const addFiles = useCallback(
+    (fileList) => {
+      const files = Array.from(fileList || []).filter((file) => file.type.startsWith("image/") || file.type.startsWith("video/"));
+      if (!files.length) {
+        showNotice("Upload an image or video file.");
+        return;
+      }
+
+      showNotice("Media attached. Qwen multimodal is selected for this request.");
+      setPendingAttachments((current) => {
+        const next = [...current, ...files.map(createPendingAttachment)];
+        const images = [];
+        const videos = [];
+        for (const attachment of next) {
+          if (attachment.kind === "image" && images.length < 3) {
+            images.push(attachment);
+          }
+          if (attachment.kind === "video" && videos.length < 1) {
+            videos.push(attachment);
+          }
+        }
+        return [...images, ...videos].slice(0, 4);
+      });
+    },
+    [showNotice],
+  );
+
+  const removePendingAttachment = useCallback((attachmentId) => {
+    setPendingAttachments((current) => {
+      const removed = current.find((attachment) => attachment.id === attachmentId);
+      if (removed?.previewUrl) {
+        URL.revokeObjectURL(removed.previewUrl);
+      }
+      return current.filter((attachment) => attachment.id !== attachmentId);
+    });
+  }, []);
+
+  const uploadAttachment = useCallback(
+    async (attachment) => {
+      const formData = new FormData();
+      formData.append("file", attachment.file, attachment.fileName);
+      formData.append("path", "/api/uploads");
+      formData.append("filename", attachment.fileName);
+      formData.append("on_conflict", "rename");
+      const result = await apiRequest(
+        "/api/files/upload",
+        {
+          method: "POST",
+          body: formData,
+        },
+        accessToken,
+      );
+      return {
+        ...serializeAttachment(attachment),
+        ...(result.file || {}),
+        status: "uploaded",
+      };
+    },
+    [accessToken],
+  );
+
   const previewWorkflow = useCallback(async ({ skipAccessCheck = false, promptOverride = "" } = {}) => {
-    if (settings.model === "Custom" && !settings.customModelName.trim()) {
-      setShowAdvanced(true);
-      showNotice("Add a custom model name first.");
-      return;
-    }
     if (isAccessLocked && !skipAccessCheck) {
       promptForAccess({ type: "preview", prompt: draft.trim() });
       return;
     }
-    const prompt = promptOverride || draft.trim() || "Write a concise launch plan for Floyo API integrations.";
+    const prompt = promptOverride || draft.trim() || "Describe the uploaded media.";
     let preview;
     try {
       preview = await apiRequest(
@@ -1245,6 +1465,7 @@ export default function App() {
             prompt,
             messages: messages.filter((message) => message.id !== "seed" && !message.loading),
             options: requestSettings,
+            media: [],
           }),
         },
         accessToken,
@@ -1260,113 +1481,151 @@ export default function App() {
     }
     setWorkflowPreview(preview);
     setShowAdvanced(true);
-  }, [accessToken, draft, isAccessLocked, messages, promptForAccess, requestSettings, settings.customModelName, settings.model, showNotice]);
+  }, [accessToken, draft, isAccessLocked, messages, promptForAccess, requestSettings]);
 
   const runFloyoPrompt = useCallback(
-    async ({ prompt, history, pendingMessageId }) => {
+    async ({ prompt, history, pendingMessageId, userMessageId, attachments = [], workflowOptions = requestSettings }) => {
       setIsRunning(true);
-    const processingTimer = window.setTimeout(() => {
-      updateActiveMessages((current) =>
-        current.map((message) =>
-          message.id === pendingMessageId && message.loading
-            ? {
-                ...message,
-                phase: "processing",
-                status: "processing",
-              }
-            : message,
-        ),
-      );
-    }, 900);
+      let processingTimer = null;
 
-    try {
-      const result = await apiRequest(
-        "/api/chat",
-        {
-          method: "POST",
-          body: JSON.stringify({
+      try {
+        const uploadedAttachments = [];
+        if (attachments.length) {
+          updateActiveMessages((current) =>
+            current.map((message) =>
+              message.id === pendingMessageId
+                ? {
+                    ...message,
+                    phase: "uploading",
+                    status: "uploading",
+                  }
+                : message,
+            ),
+          );
+
+          for (const attachment of attachments) {
+            const uploaded = await uploadAttachment(attachment);
+            uploadedAttachments.push(uploaded);
+            updateActiveMessages((current) =>
+              current.map((message) =>
+                message.id === userMessageId
+                  ? {
+                      ...message,
+                      attachments: (message.attachments || []).map((item) =>
+                        item.id === attachment.id ? serializeAttachment(uploaded, { status: "uploaded" }) : item,
+                      ),
+                    }
+                  : message,
+              ),
+            );
+          }
+        }
+
+        processingTimer = window.setTimeout(() => {
+          updateActiveMessages((current) =>
+            current.map((message) =>
+              message.id === pendingMessageId && message.loading
+                ? {
+                    ...message,
+                    phase: "processing",
+                    status: "processing",
+                  }
+                : message,
+            ),
+          );
+        }, 900);
+
+        const result = await apiRequest(
+          "/api/chat",
+          {
+            method: "POST",
+            body: JSON.stringify({
             prompt,
             messages: history,
-            options: requestSettings,
-            waitForCompletion: true,
-            pollTimeoutMs: 180000,
-          }),
-        },
-        accessToken,
-      );
+            options: workflowOptions,
+              media: uploadedAttachments.map((attachment) => ({
+                id: attachment.id,
+                inputPath: attachment.inputPath,
+                url: attachment.url,
+                mimeType: attachment.mimeType,
+                fileName: attachment.fileName,
+                kind: attachment.kind,
+              })),
+              waitForCompletion: true,
+              pollTimeoutMs: 180000,
+            }),
+          },
+          accessToken,
+        );
 
-      window.clearTimeout(processingTimer);
-      const answer = result.answer || "No text response was returned.";
-      setLastRun(result);
-      setWorkflowPreview(result.workflow);
-      updateActiveMessages((current) =>
-        current.map((message) =>
-          message.id === pendingMessageId
-            ? {
-                ...message,
-                content: "",
-                loading: true,
-                phase: "writing",
-                status: "writing",
-                runId: result.runId,
-                outputs: result.outputs,
-              }
-            : message,
-        ),
-      );
-      await sleep(Math.min(1100, Math.max(520, answer.length * 3)));
-      updateActiveMessages((current) =>
-        current.map((message) =>
-          message.id === pendingMessageId
-            ? {
-                ...message,
-                content: answer,
-                loading: false,
-                phase: "done",
-                status: result.status,
-              }
-            : message,
-        ),
-      );
-    } catch (error) {
-      window.clearTimeout(processingTimer);
-      if (error.status === 401) {
-        setAccessVerified(false);
-        setAccessDenied(true);
+        if (processingTimer) window.clearTimeout(processingTimer);
+        const answer = result.answer || "No text response was returned.";
+        setLastRun(result);
+        setWorkflowPreview(result.workflow);
+        updateActiveMessages((current) =>
+          current.map((message) =>
+            message.id === pendingMessageId
+              ? {
+                  ...message,
+                  content: "",
+                  loading: true,
+                  phase: "writing",
+                  status: "writing",
+                  runId: result.runId,
+                  outputs: result.outputs,
+                }
+              : message,
+          ),
+        );
+        await sleep(Math.min(1100, Math.max(520, answer.length * 3)));
+        updateActiveMessages((current) =>
+          current.map((message) =>
+            message.id === pendingMessageId
+              ? {
+                  ...message,
+                  content: answer,
+                  loading: false,
+                  phase: "done",
+                  status: result.status,
+                }
+              : message,
+          ),
+        );
+      } catch (error) {
+        if (processingTimer) window.clearTimeout(processingTimer);
+        if (error.status === 401) {
+          setAccessVerified(false);
+          setAccessDenied(true);
+        }
+        updateActiveMessages((current) =>
+          current.map((message) =>
+            message.id === pendingMessageId
+              ? {
+                  ...message,
+                  content: error.message,
+                  loading: false,
+                  phase: "failed",
+                  status: "failed",
+                }
+              : message,
+          ),
+        );
+      } finally {
+        setIsRunning(false);
+        inputRef.current?.focus();
       }
-      updateActiveMessages((current) =>
-        current.map((message) =>
-          message.id === pendingMessageId
-            ? {
-                ...message,
-                content: error.message,
-                loading: false,
-                phase: "failed",
-                status: "failed",
-              }
-            : message,
-        ),
-      );
-    } finally {
-      setIsRunning(false);
-      inputRef.current?.focus();
-    }
     },
-    [accessToken, requestSettings, updateActiveMessages],
+    [accessToken, requestSettings, updateActiveMessages, uploadAttachment],
   );
 
   const sendMessage = useCallback(async ({ skipAccessCheck = false, promptOverride = "" } = {}) => {
-    const prompt = promptOverride || draft.trim();
-    if (!prompt || isRunning) {
+    const attachments = pendingAttachments;
+    const prompt = promptOverride || draft.trim() || (attachments.length ? "Describe the uploaded media." : "");
+    if ((!prompt && !attachments.length) || isRunning) {
       return;
     }
     if (isAccessLocked && !skipAccessCheck) {
       promptForAccess({ type: "send", prompt });
-      return;
-    }
-    if (settings.model === "Custom" && !settings.customModelName.trim()) {
-      setShowAdvanced(true);
-      showNotice("Add a custom model name first.");
       return;
     }
 
@@ -1374,6 +1633,7 @@ export default function App() {
       id: crypto.randomUUID(),
       role: "user",
       content: prompt,
+      attachments: attachments.map((attachment) => serializeAttachment(attachment, { status: "queued" })),
       createdAt: Date.now(),
     };
     const pendingMessage = {
@@ -1388,20 +1648,26 @@ export default function App() {
     const history = [...messages.filter((message) => message.id !== "seed" && !message.loading), userMessage];
 
     setDraft("");
+    setPendingAttachments([]);
     setEditingMessageId("");
     setEditingText("");
     updateActiveMessages((current) => [...current, userMessage, pendingMessage], prompt);
-    await runFloyoPrompt({ prompt, history, pendingMessageId: pendingMessage.id });
+    await runFloyoPrompt({
+      prompt,
+      history,
+      pendingMessageId: pendingMessage.id,
+      userMessageId: userMessage.id,
+      attachments,
+      workflowOptions: requestSettings,
+    });
   }, [
     draft,
     isAccessLocked,
     isRunning,
     messages,
+    pendingAttachments,
     promptForAccess,
     runFloyoPrompt,
-    settings.customModelName,
-    settings.model,
-    showNotice,
     updateActiveMessages,
   ]);
 
@@ -1426,11 +1692,6 @@ export default function App() {
       }
       if (isAccessLocked && !skipAccessCheck) {
         promptForAccess({ type: "edit", messageId });
-        return;
-      }
-      if (settings.model === "Custom" && !settings.customModelName.trim()) {
-        setShowAdvanced(true);
-        showNotice("Add a custom model name first.");
         return;
       }
 
@@ -1473,9 +1734,6 @@ export default function App() {
       messages,
       promptForAccess,
       runFloyoPrompt,
-      settings.customModelName,
-      settings.model,
-      showNotice,
       updateActiveMessages,
     ],
   );
@@ -1509,6 +1767,10 @@ export default function App() {
         onSelect={(conversationId) => {
           setActiveConversationId(conversationId);
           setDraft("");
+          setPendingAttachments((current) => {
+            current.forEach((attachment) => attachment.previewUrl && URL.revokeObjectURL(attachment.previewUrl));
+            return [];
+          });
           setEditingMessageId("");
           setEditingText("");
           setWorkflowPreview(null);
@@ -1523,7 +1785,7 @@ export default function App() {
         <header className="chat-header">
           <div>
             <h2>{isEmptyChat ? "FloyoGPT" : activeConversation?.title || "New chat"}</h2>
-            <p>{settings.model === "Custom" ? settings.customModelName || "Custom model" : settings.model}</p>
+            <p>{mediaLocked ? `${QWEN_MODEL_LABEL} · Media request` : `${effectiveModelLabel} · ${usesQwenWorkflow ? "Multimodal" : "LLM"}`}</p>
           </div>
           <div className="chat-header-actions">
             <StatusPill config={config} />
@@ -1564,45 +1826,79 @@ export default function App() {
         </div>
 
         <form
-          className="composer"
+          className={classNames("composer", isDraggingFiles && "dragging")}
+          onDragEnter={(event) => {
+            event.preventDefault();
+            setIsDraggingFiles(true);
+          }}
+          onDragOver={(event) => {
+            event.preventDefault();
+            setIsDraggingFiles(true);
+          }}
+          onDragLeave={(event) => {
+            if (!event.currentTarget.contains(event.relatedTarget)) {
+              setIsDraggingFiles(false);
+            }
+          }}
+          onDrop={(event) => {
+            event.preventDefault();
+            setIsDraggingFiles(false);
+            addFiles(event.dataTransfer.files);
+          }}
           onSubmit={(event) => {
             event.preventDefault();
             sendMessage();
           }}
         >
           <div className="composer-box">
-            <button type="button" className="composer-plus-button" onClick={() => setShowAdvanced(true)} title="Advanced options">
-              <Plus size={23} />
+            <button type="button" className="composer-plus-button" onClick={() => fileInputRef.current?.click()} title="Attach image or video">
+              <Paperclip size={21} />
             </button>
-            <textarea
-              ref={inputRef}
-              value={draft}
-              rows={1}
-              placeholder="Ask anything"
-              onChange={(event) => setDraft(event.target.value)}
-              onKeyDown={(event) => {
-                if (event.key === "Enter" && !event.shiftKey) {
-                  event.preventDefault();
-                  sendMessage();
-                }
+            <input
+              ref={fileInputRef}
+              type="file"
+              className="hidden-file-input"
+              accept="image/*,video/*"
+              multiple
+              onChange={(event) => {
+                addFiles(event.target.files);
+                event.target.value = "";
               }}
             />
+            <div className="composer-input-stack">
+              <AttachmentList attachments={pendingAttachments.map((attachment) => serializeAttachment(attachment))} onRemove={removePendingAttachment} />
+              <textarea
+                ref={inputRef}
+                value={draft}
+                rows={1}
+                placeholder="Ask anything"
+                onChange={(event) => setDraft(event.target.value)}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter" && !event.shiftKey) {
+                    event.preventDefault();
+                    sendMessage();
+                  }
+                }}
+              />
+            </div>
             <div className="composer-actions">
               <ModelPicker
                 settings={settings}
                 modelOptions={modelOptions}
-                onModelSelect={updateModelSelection}
-                onToggleReasoning={toggleReasoning}
+                effectiveModel={effectiveModel}
+                mediaLocked={mediaLocked}
+                onModelSelect={handleModelSelect}
+                onToggleReasoning={toggleThinking}
               />
               <button
                 type="button"
-                className={classNames("reasoning-toggle-button", settings.reasoning && "active")}
-                onClick={toggleReasoning}
-                aria-pressed={settings.reasoning}
-                title={settings.reasoning ? "Turn reasoning off" : "Turn reasoning on"}
+                className={classNames("reasoning-toggle-button", (usesQwenWorkflow ? settings.enableThinking : settings.reasoning) && "active")}
+                onClick={toggleThinking}
+                aria-pressed={usesQwenWorkflow ? settings.enableThinking : settings.reasoning}
+                title={usesQwenWorkflow ? (settings.enableThinking ? "Turn thinking off" : "Turn thinking on") : (settings.reasoning ? "Turn reasoning off" : "Turn reasoning on")}
               >
                 <span />
-                {settings.reasoning ? "Reasoning on" : "Reasoning off"}
+                {usesQwenWorkflow ? (settings.enableThinking ? "Thinking on" : "Thinking off") : (settings.reasoning ? "Reasoning on" : "Reasoning off")}
               </button>
               <button type="button" className="icon-button ghost composer-icon" onClick={() => setShowAdvanced(true)} title="Node settings">
                 <SlidersHorizontal size={18} />
@@ -1613,14 +1909,15 @@ export default function App() {
               <button type="button" className="icon-button" onClick={previewWorkflow} title="Preview workflow JSON">
                 <FileJson size={17} />
               </button>
-              <button type="submit" className="send-button" disabled={!draft.trim() || isRunning} title="Run workflow">
+              <button type="submit" className="send-button" disabled={(!draft.trim() && !pendingAttachments.length) || isRunning} title="Run workflow">
                 {isRunning ? <Loader2 className="spin" size={17} /> : <Send size={17} />}
               </button>
             </div>
           </div>
           <div className="drop-hint">
             <Sparkles size={14} />
-            LLM_floyo · Temperature {settings.temperature} · Max tokens {settings.maxTokens || "auto"}
+            {mediaLocked ? "Media locked to Qwen" : effectiveModelLabel} · Temperature {settings.temperature}
+            {usesQwenWorkflow ? ` · Top P ${settings.topP}` : ""} · Max tokens {settings.maxTokens || "auto"} · Context on
           </div>
         </form>
       </section>
@@ -1631,7 +1928,9 @@ export default function App() {
         activePreset={activePreset}
         setActivePreset={setActivePreset}
         config={config}
-        models={models}
+        models={modelOptions}
+        effectiveModel={effectiveModel}
+        mediaLocked={mediaLocked}
         workflowPreview={workflowPreview}
         lastRun={lastRun}
         onPreviewWorkflow={previewWorkflow}
