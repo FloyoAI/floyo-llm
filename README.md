@@ -1,82 +1,105 @@
 # FloyoGPT
 
-ChatGPT/Codex-style local app for running Floyo `LLM_floyo` text workflows and the `AlibabaQwen35Plus_floyo` multimodal workflow through the Floyo API.
+An open-source ChatGPT-style web app powered by the [Floyo API](https://floyo.ai). Chat with 20+ leading LLMs, drop in an image or video, and get multimodal answers, all from one window.
 
-## Setup
+**Live demo:** https://floyo-llm.vercel.app
+
+## What you get
+
+- Familiar chat interface with conversation history saved in your browser
+- 20+ models to choose from (Claude, GPT, Gemini, DeepSeek, Grok, Qwen, and more), plus a Custom field for any model name
+- Image and video uploads. The app automatically switches to Alibaba Qwen 3.5 Plus when you attach media
+- Markdown answers with code highlighting and a one-click copy button on every code block
+- System prompt, temperature, top_p, max tokens, and reasoning toggle all editable in the UI
+- One codebase that works the same on your laptop and on Vercel
+
+## Quick start
+
+You need:
+
+- Node.js 18 or newer
+- A Floyo API key (steps below)
+
+Clone, install, and copy the env file:
 
 ```bash
-cd /Users/ritik/Desktop/Floyo/API-NODES/floyo-llm-codex
+git clone https://github.com/ritik-devsecops/floyo-llm.git
+cd floyo-llm
 npm install
 cp .env.example .env
 ```
 
-Add your default server key in `.env`:
+Open `.env` and fill in:
 
 ```bash
-FLOYO_API_KEY=your_key_here
-FLOYO_API_BASE_URL=https://api.floyo.ai
-FLOYO_CDN_URL=https://cdn.floyo.ai
-APP_ACCESS_TOKEN=long_random_private_token
-PORT=8788
+FLOYO_API_KEY=flo_paste_your_real_key_here
+APP_ACCESS_TOKEN=any_long_random_string_you_choose
 ```
 
-Run:
+Run the app:
 
 ```bash
 npm run dev
 ```
 
-Open:
+Open http://localhost:5174 in your browser. The backend runs on http://localhost:8788.
 
-```text
-http://localhost:5174
+## Get a Floyo API key
+
+1. Sign up at https://floyo.ai
+2. Open your dashboard and go to the API Keys section
+3. Click "Create API Key", give it a name, and copy the key. It starts with `flo_`
+4. Paste it into your `.env` file as `FLOYO_API_KEY`
+
+Full step-by-step instructions: https://docs.floyo.ai/floyo-api
+
+## Environment variables
+
+| Name | Required | Purpose |
+| --- | --- | --- |
+| `FLOYO_API_KEY` | Yes | Your Floyo API key. Used as the server default. |
+| `APP_ACCESS_TOKEN` | Yes in production | A private token the frontend sends to unlock requests. Choose any 32+ character random string. Anyone who has this token can use your Floyo key, so keep it secret. |
+| `FLOYO_API_BASE_URL` | No | Defaults to `https://api.floyo.ai` |
+| `FLOYO_CDN_URL` | No | Defaults to `https://cdn.floyo.ai` |
+| `PORT` | No | Local backend port. Defaults to `8788` |
+
+In production, users can also paste their own Floyo API key directly into the app, in which case `APP_ACCESS_TOKEN` is not needed for that session.
+
+## Deploy to Vercel
+
+1. Fork this repo on GitHub
+2. Go to https://vercel.com and click "Import Project"
+3. Pick your fork
+4. In Project Settings, add the four environment variables above
+5. Deploy
+
+That is the full setup. Future pushes to `main` redeploy automatically.
+
+Note: Vercel limits request bodies to about 4.5 MB, so very large video uploads will fail on production. Local dev allows up to 25 MB.
+
+## How it works
+
+- **Frontend** (`src/`): React and Vite. API keys are kept in memory only, never written to disk.
+- **Backend** (`server/`): Express. Takes chat requests, builds a Floyo workflow JSON, and posts to Floyo's `POST /runs`, then polls until the run finishes.
+- **Vercel wrappers** (`api/`): Tiny files that re-export the Express app so each endpoint becomes a serverless function.
+- **Workflow templates** (`data/`): Reference JSON for the two workflows the app drives (text LLM and Qwen multimodal).
+
+When you attach an image or video, the backend uploads the file to Floyo CDN, then builds a Qwen multimodal workflow with that file as input. Text-only requests use whichever model you picked in the UI.
+
+## Project structure
+
+```
+api/         Vercel serverless route files
+server/      Express backend
+src/         React frontend
+data/        Workflow JSON templates
+public/      Static assets
 ```
 
-The local API server runs on `http://localhost:8788`.
+## Contributing
 
-## Supported Workflow Inputs
+Issues and pull requests are welcome. If you build something on top of this, share it with us at https://floyo.ai.
 
-- `prompt`
-- `model`
-- `system_prompt`
-- `temperature`
-- `reasoning`
-- `top_p`
-- `max_tokens`
-- `enable_thinking`
-- image uploads through Floyo CDN `/upload`, passed into Qwen through `LoadImage`
-- video uploads through Floyo CDN `/upload`, passed into Qwen through `input_video_url`
+## License
 
-Text-only requests use the selected `LLM_floyo` model by default. Users can manually select Alibaba Qwen3.5 Plus for text-only multimodal-style reasoning. When an image or video is attached, the app automatically locks the request to Alibaba Qwen3.5 Plus and hides other model choices until the media is removed. The server enforces the same rule, so media requests cannot accidentally run through the text-only LLM workflow.
-
-## Response Formatting
-
-Assistant responses render with GitHub-flavored Markdown, including headings, lists, tables, links, inline code, and fenced code blocks. Code blocks include syntax highlighting, a language label, and a per-snippet copy button.
-
-## Conversation Context
-
-Every request includes the current chat history as a structured context block, so model switches keep continuity across previous user and assistant turns. The server packs the latest turns first and keeps the payload within a bounded context budget. Previous media is summarized in the transcript, while only media attached to the current request is sent as an active Qwen image/video input.
-
-## Vercel
-
-Set these environment variables in Vercel before production use:
-
-```bash
-FLOYO_API_KEY=your_key_here
-FLOYO_API_BASE_URL=https://api.floyo.ai
-FLOYO_CDN_URL=https://cdn.floyo.ai
-APP_ACCESS_TOKEN=long_random_private_token
-```
-
-The app includes Vercel serverless API wrappers under `api/`, so the frontend can call `/api/chat`, `/api/config`, `/api/files/upload`, and run status endpoints after deployment. In production, users can unlock a request with either `APP_ACCESS_TOKEN` or a Floyo API key. Floyo keys are validated by a tiny secure Floyo CDN upload before the pending request continues. API keys are kept in memory only and are not persisted across page refreshes.
-
-## API Flow
-
-1. Frontend keeps the token in memory only, then sends it with the chat and settings to the Express server.
-2. Server verifies app access tokens locally or validates the supplied Floyo API key with a small Floyo CDN upload.
-3. Browser image/video files are uploaded through the server to Floyo CDN `/upload`.
-4. Server builds a bounded current-chat context block from previous turns.
-5. Server builds either `LLM_floyo` or Qwen workflow JSON. Media requests always build Qwen JSON using uploaded `input_path` values and presigned video URLs.
-6. Server posts to `POST /runs` with the configured key or user-provided Floyo key.
-7. Server polls `GET /runs/:id`.
-8. Server returns status, text candidates, outputs, raw run data, and the generated workflow JSON.
+MIT (add your own `LICENSE` file before publishing).
