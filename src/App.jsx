@@ -3,6 +3,7 @@ import {
   Bot,
   Boxes,
   Braces,
+  Check,
   CheckCircle2,
   ChevronDown,
   Clipboard,
