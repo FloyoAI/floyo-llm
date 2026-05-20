@@ -18,28 +18,50 @@ A ChatGPT-style web app for chatting with 20+ leading LLMs and multimodal models
 
 ## Quick start (local)
 
-You need Node.js 18 or newer.
+You need Node.js 18 or newer. Install it from https://nodejs.org if you do not have it.
+
+### One-time setup
 
 ```bash
 git clone https://github.com/FloyoAI/floyo-llm.git
 cd floyo-llm
 npm install
-cp .env.example .env
 ```
 
-Open `.env` in your editor and paste your Floyo API key:
+Create a `.env` file in the repo root (next to `package.json`):
+
+```bash
+# macOS / Linux
+cp .env.example .env
+
+# Windows (PowerShell)
+Copy-Item .env.example .env
+```
+
+Open `.env` in any text editor (VS Code, Sublime, Notepad, nano) and paste your Floyo API key on the `FLOYO_API_KEY` line:
 
 ```bash
 FLOYO_API_KEY=flo_your_real_key_here
 ```
 
-Start the app:
+### Run the app
 
 ```bash
 npm run dev
 ```
 
-Open http://localhost:5174 in your browser. That is it.
+You should see something like this in the terminal:
+
+```
+FloyoGPT Qwen server listening on http://localhost:8788
+
+  VITE v7.x.x  ready in 180 ms
+  ➜  Local:   http://localhost:5174/
+```
+
+Now open http://localhost:5174 in your browser. The app is ready to use.
+
+To stop the app, press `Ctrl+C` in the terminal. To start it again later, just run `npm run dev` from the project folder.
 
 ## Get a Floyo API key
 
