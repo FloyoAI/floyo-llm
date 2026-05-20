@@ -128,6 +128,50 @@ textarea:focus {
   border-right: 1px solid #2b2b2b;
   background: var(--sidebar-bg);
   padding: 18px 8px 12px;
+  transition: transform 0.22s ease;
+}
+
+/* Desktop-only: collapse the sidebar by shrinking its grid column to 0 so
+   the chat area expands to fill the viewport. On tablet and mobile the
+   sidebar is a position:fixed drawer (see the media query below), so this
+   rule should not apply there. */
+@media (min-width: 821px) {
+  .app-shell.sidebar-collapsed {
+    grid-template-columns: 0 minmax(0, 1fr);
+  }
+
+  .app-shell.sidebar-collapsed .history-sidebar {
+    transform: translateX(-100%);
+    visibility: hidden;
+    pointer-events: none;
+  }
+}
+
+.sidebar-open-button {
+  position: fixed;
+  top: 16px;
+  left: 16px;
+  z-index: 50;
+  width: 40px;
+  height: 40px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 12px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(28, 28, 28, 0.92);
+  color: #e6e6e6;
+  cursor: pointer;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.35);
+  backdrop-filter: blur(6px);
+}
+
+.sidebar-open-button:hover {
+  background: rgba(40, 40, 40, 0.98);
+}
+
+.sidebar-scrim {
+  display: none;
 }
 
 .sidebar-brand,
@@ -1581,93 +1625,6 @@ textarea:focus {
   font-size: 13px;
 }
 
-.access-gate {
-  position: fixed;
-  inset: 0;
-  z-index: 60;
-  display: grid;
-  place-items: center;
-  background: rgba(17, 17, 17, 0.72);
-  backdrop-filter: blur(10px);
-  padding: 22px;
-}
-
-.access-card {
-  width: min(420px, 100%);
-  display: grid;
-  gap: 13px;
-  border: 1px solid #3e3e3e;
-  border-radius: 24px;
-  background: #242424;
-  box-shadow: var(--shadow);
-  padding: 24px;
-}
-
-.access-mark {
-  width: 48px;
-  height: 48px;
-  display: grid;
-  place-items: center;
-  border-radius: 999px;
-  background: #123f25;
-  color: #bdf6d4;
-}
-
-.access-card h2 {
-  margin: 2px 0 0;
-  color: #fff;
-  font-size: 22px;
-}
-
-.access-card p {
-  margin: 0;
-  color: #b7b7b7;
-  line-height: 1.6;
-}
-
-.access-card .access-note {
-  color: #8f8f8f;
-  font-size: 13px;
-}
-
-.access-card a {
-  color: #f4f4f4;
-  font-weight: 760;
-  text-decoration: underline;
-  text-underline-offset: 3px;
-}
-
-.access-card a:hover {
-  color: #ffffff;
-}
-
-.access-card input {
-  width: 100%;
-  border-color: #4a4a4a;
-  background: #171717;
-  color: #fff;
-}
-
-.access-card button {
-  width: 100%;
-  min-height: 46px;
-  border: 0;
-  background: #fff;
-  color: #111;
-}
-
-.access-card .access-secondary-button {
-  border: 1px solid #474747;
-  background: transparent;
-  color: #e7e7e7;
-}
-
-.access-error {
-  color: #ff9aa2;
-  font-size: 13px;
-  font-weight: 700;
-}
-
 .spin {
   animation: spin 0.8s linear infinite;
 }
@@ -1722,12 +1679,42 @@ textarea:focus {
 }
 
 @media (max-width: 820px) {
+  /* On tablet and below the sidebar becomes a slide-over drawer. The grid
+     stays single-column and the sidebar is positioned over the content. */
   .app-shell {
     grid-template-columns: 1fr;
   }
 
   .history-sidebar {
-    display: none;
+    position: fixed;
+    top: 0;
+    left: 0;
+    width: min(312px, 86vw);
+    z-index: 40;
+    box-shadow: 0 24px 50px rgba(0, 0, 0, 0.45);
+  }
+
+  .app-shell:not(.sidebar-collapsed) .sidebar-scrim {
+    display: block;
+    position: fixed;
+    inset: 0;
+    z-index: 35;
+    background: rgba(0, 0, 0, 0.55);
+    border: 0;
+    padding: 0;
+    cursor: pointer;
+  }
+
+  /* Default to collapsed on tablet/mobile so the chat is visible on first
+     load. The user toggles the drawer with the floating open button. */
+  .app-shell:not(.sidebar-collapsed) .history-sidebar {
+    transform: translateX(0);
+    visibility: visible;
+    pointer-events: auto;
+  }
+
+  .app-shell.sidebar-collapsed .history-sidebar {
+    transform: translateX(-100%);
   }
 
   .chat-header h2,

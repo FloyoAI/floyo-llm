@@ -3,7 +3,6 @@ import {
   Bot,
   Boxes,
   Braces,
-  Check,
   CheckCircle2,
   ChevronDown,
   Clipboard,
@@ -14,7 +13,6 @@ import {
   Film,
   FolderOpen,
   Image as ImageIcon,
-  KeyRound,
   LibraryBig,
   Loader2,
   MessageSquarePlus,
@@ -40,13 +38,18 @@ import remarkGfm from "remark-gfm";
 
 const SETTINGS_STORAGE_KEY = "floyo-llm-codex-settings";
 const CONVERSATIONS_STORAGE_KEY = "floyo-llm-codex-conversations";
-const SESSION_ACCESS_TOKEN_STORAGE_KEY = "floyo-llm-codex-session-access-token";
-const SESSION_ACCESS_ACCOUNT_STORAGE_KEY = "floyo-llm-codex-session-access-account";
-const LEGACY_ACCESS_TOKEN_STORAGE_KEY = "floyo-llm-codex-access-token";
-const LEGACY_ACCESS_ACCOUNT_STORAGE_KEY = "floyo-llm-codex-access-account";
-const DEFAULT_ACCOUNT_ID = "guest";
-const FLOYO_ACCESS_INSTRUCTIONS_URL =
-  "https://shared.archbee.space/public/PREVIEW-WejOAlhAmyJ3PP37IK_LR/PREVIEW-eANCv0feHV1nQbGY0KMmo";
+const SIDEBAR_COLLAPSED_STORAGE_KEY = "floyo-llm-codex-sidebar-collapsed";
+
+// Legacy keys from a previous version that used to store an API key in the
+// browser. We aggressively clear them on first load so no Floyo key can
+// linger in localStorage or sessionStorage on upgraded installs.
+const LEGACY_BROWSER_KEYS = [
+  "floyo-llm-codex-access-token",
+  "floyo-llm-codex-access-account",
+  "floyo-llm-codex-session-access-token",
+  "floyo-llm-codex-session-access-account",
+];
+
 const LEGACY_DEFAULT_SYSTEM_PROMPT =
   "You are Floyo Codex, a precise coding and multimodal assistant. Answer directly, keep code runnable, and mention assumptions when needed.";
 const QWEN_MODEL_ID = "alibaba/qwen3.5-plus-multimodal";
@@ -255,17 +258,9 @@ function readSavedSettings() {
   }
 }
 
-function conversationStorageKey(accountId = DEFAULT_ACCOUNT_ID) {
-  return `${CONVERSATIONS_STORAGE_KEY}:${accountId || DEFAULT_ACCOUNT_ID}`;
-}
-
-function readSavedConversations(accountId = DEFAULT_ACCOUNT_ID) {
+function readSavedConversations() {
   try {
-    const key = conversationStorageKey(accountId);
-    let saved = JSON.parse(localStorage.getItem(key) || "[]");
-    if ((!Array.isArray(saved) || saved.length === 0) && accountId === DEFAULT_ACCOUNT_ID) {
-      saved = JSON.parse(localStorage.getItem(CONVERSATIONS_STORAGE_KEY) || "[]");
-    }
+    const saved = JSON.parse(localStorage.getItem(CONVERSATIONS_STORAGE_KEY) || "[]");
     if (!Array.isArray(saved) || saved.length === 0) {
       return [createConversation()];
     }
@@ -282,69 +277,55 @@ function readSavedConversations(accountId = DEFAULT_ACCOUNT_ID) {
   }
 }
 
-function clearSavedAccess() {
-  try {
-    localStorage.removeItem(LEGACY_ACCESS_TOKEN_STORAGE_KEY);
-    localStorage.removeItem(LEGACY_ACCESS_ACCOUNT_STORAGE_KEY);
-  } catch {
-    // Legacy access tokens are intentionally removed from persistent storage.
+// Defensive scrub on every page load: remove any access-token-like values
+// that older versions of the app used to keep here. The current app never
+// writes them; this just protects users who are upgrading from an old build.
+function purgeLegacyBrowserSecrets() {
+  for (const key of LEGACY_BROWSER_KEYS) {
+    try {
+      localStorage.removeItem(key);
+    } catch {
+      // ignore
+    }
+    try {
+      sessionStorage.removeItem(key);
+    } catch {
+      // ignore
+    }
   }
 }
 
-function tokenLooksLikeFloyoKey(value = "") {
-  return String(value || "").trim().startsWith("flo_");
-}
-
-function writeSessionAccess(token, accountId = DEFAULT_ACCOUNT_ID) {
-  try {
-    sessionStorage.setItem(SESSION_ACCESS_TOKEN_STORAGE_KEY, token);
-    sessionStorage.setItem(SESSION_ACCESS_ACCOUNT_STORAGE_KEY, accountId || DEFAULT_ACCOUNT_ID);
-  } catch {
-    // Some private browser contexts can block sessionStorage.
-  }
-}
-
-function clearSessionAccess() {
-  try {
-    sessionStorage.removeItem(SESSION_ACCESS_TOKEN_STORAGE_KEY);
-    sessionStorage.removeItem(SESSION_ACCESS_ACCOUNT_STORAGE_KEY);
-  } catch {
-    // Some private browser contexts can block sessionStorage.
-  }
-}
-
-function readSavedAccessToken() {
-  clearSavedAccess();
-  try {
-    return sessionStorage.getItem(SESSION_ACCESS_TOKEN_STORAGE_KEY) || "";
-  } catch {
-    return "";
-  }
-}
-
-function readInitialAccessState() {
-  clearSavedAccess();
-  let accountId = DEFAULT_ACCOUNT_ID;
-  try {
-    accountId = sessionStorage.getItem(SESSION_ACCESS_ACCOUNT_STORAGE_KEY) || DEFAULT_ACCOUNT_ID;
-  } catch {
-    accountId = DEFAULT_ACCOUNT_ID;
-  }
-  const conversations = readSavedConversations(accountId);
+function readInitialState() {
+  purgeLegacyBrowserSecrets();
+  const conversations = readSavedConversations();
   return {
-    accountId,
     conversations,
     activeConversationId: conversations[0]?.id,
   };
 }
 
-async function apiRequest(path, options = {}, accessToken = "") {
+function readSavedSidebarCollapsed() {
+  try {
+    const saved = localStorage.getItem(SIDEBAR_COLLAPSED_STORAGE_KEY);
+    if (saved === "1") return true;
+    if (saved === "0") return false;
+  } catch {
+    // ignore
+  }
+  // No saved preference: default to collapsed on small screens (drawer style)
+  // and open on desktop.
+  if (typeof window !== "undefined" && typeof window.matchMedia === "function") {
+    return window.matchMedia("(max-width: 820px)").matches;
+  }
+  return false;
+}
+
+async function apiRequest(path, options = {}) {
   const isFormData = typeof FormData !== "undefined" && options.body instanceof FormData;
   const response = await fetch(path, {
     ...options,
     headers: {
       ...(isFormData ? {} : { "Content-Type": "application/json" }),
-      ...(accessToken ? { "X-Floyo-App-Token": accessToken } : {}),
       ...(options.headers || {}),
     },
   });
@@ -410,60 +391,13 @@ function sleep(ms) {
   return new Promise((resolve) => window.setTimeout(resolve, ms));
 }
 
-function StatusPill({ config, accessVerified, requiresAccessToken }) {
-  const ready = requiresAccessToken ? accessVerified : config?.hasApiKey;
+function StatusPill({ config }) {
+  const ready = Boolean(config?.hasApiKey);
   return (
-    <span className={classNames("status-pill", ready ? "ready" : "blocked")}>
+    <span className={classNames("status-pill", ready ? "ready" : "blocked")} title={ready ? "Server has a Floyo API key configured" : "Set FLOYO_API_KEY in the server .env"}>
       {ready ? <CheckCircle2 size={14} /> : <XCircle size={14} />}
-      {ready ? "API key active" : "API key required"}
+      {ready ? "API ready" : "API key missing"}
     </span>
-  );
-}
-
-function AccessGate({ accessToken, accessDenied, isCheckingAccess, onVerifyAccessToken, onCancel }) {
-  const [draftToken, setDraftToken] = useState(accessToken);
-
-  useEffect(() => {
-    setDraftToken(accessToken);
-  }, [accessToken]);
-
-  return (
-    <div className="access-gate" role="dialog" aria-modal="true" aria-label="Floyo app access">
-      <form
-        className="access-card"
-        onSubmit={(event) => {
-          event.preventDefault();
-          onVerifyAccessToken(draftToken);
-        }}
-      >
-        <div className="access-mark">
-          <Check size={22} />
-        </div>
-        <h2>FloyoGPT access</h2>
-        <p>
-          Enter a valid Floyo API key or app access token to continue this request. The key is checked with a tiny secure Floyo upload before the request runs.{" "}
-          <a href={FLOYO_ACCESS_INSTRUCTIONS_URL} target="_blank" rel="noreferrer">
-            Setup instructions
-          </a>
-        </p>
-        <p className="access-note">Your key is stored only in this browser tab session. You can change it from the header at any time.</p>
-        <input
-          name="accessToken"
-          type="password"
-          value={draftToken}
-          placeholder="Enter Floyo API key or app access token"
-          onChange={(event) => setDraftToken(event.target.value)}
-          autoFocus
-        />
-        {accessDenied ? <span className="access-error">Invalid Floyo API key or app access token.</span> : null}
-        <button type="submit" disabled={!draftToken.trim() || isCheckingAccess}>
-          {isCheckingAccess ? "Checking..." : "Continue"}
-        </button>
-        <button type="button" className="access-secondary-button" onClick={onCancel} disabled={isCheckingAccess}>
-          Cancel
-        </button>
-      </form>
-    </div>
   );
 }
 
@@ -913,12 +847,18 @@ function SidebarNavButton({ item, onClick }) {
   );
 }
 
-function HistorySidebar({ conversations, activeConversationId, onSelect, onNew, onDelete, onReset }) {
+function HistorySidebar({ conversations, activeConversationId, onSelect, onNew, onDelete, onReset, collapsed, onToggleCollapsed }) {
   return (
-    <aside className="history-sidebar">
+    <aside className={classNames("history-sidebar", collapsed && "collapsed")} aria-hidden={collapsed}>
       <div className="sidebar-brand">
         <h1>FloyoGPT</h1>
-        <button type="button" className="icon-button ghost" title="Collapse sidebar">
+        <button
+          type="button"
+          className="icon-button ghost sidebar-collapse-button"
+          onClick={onToggleCollapsed}
+          aria-label={collapsed ? "Open sidebar" : "Collapse sidebar"}
+          title={collapsed ? "Open sidebar" : "Collapse sidebar"}
+        >
           <PanelLeft size={18} />
         </button>
       </div>
@@ -1128,14 +1068,13 @@ function AdvancedPanel({
 }
 
 export default function App() {
-  const initialAccessState = useMemo(readInitialAccessState, []);
+  const initialState = useMemo(readInitialState, []);
   const [config, setConfig] = useState(null);
   const [models, setModels] = useState(FALLBACK_MODELS);
   const [settings, setSettings] = useState(readSavedSettings);
   const [activePreset, setActivePreset] = useState("codex");
-  const [accessAccountId, setAccessAccountId] = useState(initialAccessState.accountId);
-  const [conversations, setConversations] = useState(initialAccessState.conversations);
-  const [activeConversationId, setActiveConversationId] = useState(initialAccessState.activeConversationId);
+  const [conversations, setConversations] = useState(initialState.conversations);
+  const [activeConversationId, setActiveConversationId] = useState(initialState.activeConversationId);
   const [draft, setDraft] = useState("");
   const [isRunning, setIsRunning] = useState(false);
   const [showAdvanced, setShowAdvanced] = useState(false);
@@ -1144,14 +1083,9 @@ export default function App() {
   const [notice, setNotice] = useState("");
   const [editingMessageId, setEditingMessageId] = useState("");
   const [editingText, setEditingText] = useState("");
-  const [accessToken, setAccessToken] = useState(readSavedAccessToken);
-  const [accessDenied, setAccessDenied] = useState(false);
-  const [accessVerified, setAccessVerified] = useState(false);
-  const [isCheckingAccess, setIsCheckingAccess] = useState(false);
-  const [showAccessPrompt, setShowAccessPrompt] = useState(false);
-  const [pendingAccessAction, setPendingAccessAction] = useState(null);
   const [pendingAttachments, setPendingAttachments] = useState([]);
   const [isDraggingFiles, setIsDraggingFiles] = useState(false);
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(readSavedSidebarCollapsed);
   const scrollRef = useRef(null);
   const inputRef = useRef(null);
   const fileInputRef = useRef(null);
@@ -1166,13 +1100,23 @@ export default function App() {
     [messages],
   );
   const isEmptyChat = visibleMessages.length === 0;
-  const requiresAccessToken = Boolean(config?.requiresAccessToken);
-  const isAccessLocked = requiresAccessToken && !accessVerified;
   const modelOptions = useMemo(() => uniqueModels([...(models?.length ? models : FALLBACK_MODELS), QWEN_MODEL_ID]), [models]);
   const mediaLocked = pendingAttachments.length > 0;
   const effectiveModel = mediaLocked ? QWEN_MODEL_ID : settings.model || DEFAULT_SETTINGS.model;
   const usesQwenWorkflow = effectiveModel === QWEN_MODEL_ID;
   const effectiveModelLabel = modelDisplayName(effectiveModel === "Custom" ? settings.customModelName || "Custom" : effectiveModel);
+
+  const toggleSidebar = useCallback(() => {
+    setSidebarCollapsed((current) => {
+      const next = !current;
+      try {
+        localStorage.setItem(SIDEBAR_COLLAPSED_STORAGE_KEY, next ? "1" : "0");
+      } catch {
+        // ignore
+      }
+      return next;
+    });
+  }, []);
 
   useEffect(() => {
     apiRequest("/api/config")
@@ -1192,131 +1136,8 @@ export default function App() {
   }, [settings]);
 
   useEffect(() => {
-    localStorage.setItem(conversationStorageKey(accessAccountId), JSON.stringify(conversations));
-  }, [accessAccountId, conversations]);
-
-  const loadAccountConversations = useCallback((accountId) => {
-    const nextConversations = readSavedConversations(accountId);
-    setConversations(nextConversations);
-    setActiveConversationId(nextConversations[0]?.id);
-    setDraft("");
-    setEditingMessageId("");
-    setEditingText("");
-    setLastRun(null);
-    setWorkflowPreview(null);
-  }, []);
-
-  const verifyAccessToken = useCallback(async (tokenValue) => {
-    const nextToken = String(tokenValue || "").trim();
-    if (!nextToken) {
-      setAccessVerified(false);
-      setAccessDenied(true);
-      return false;
-    }
-
-    setIsCheckingAccess(true);
-    setAccessDenied(false);
-
-    try {
-      const verification = await apiRequest(
-        "/api/access/verify",
-        {
-          method: "POST",
-          body: JSON.stringify({}),
-        },
-        nextToken,
-      );
-      const nextAccountId = verification.accountId || DEFAULT_ACCOUNT_ID;
-      setAccessToken(nextToken);
-      setAccessAccountId(nextAccountId);
-      writeSessionAccess(nextToken, nextAccountId);
-      if (nextAccountId !== accessAccountId) {
-        loadAccountConversations(nextAccountId);
-      }
-      setAccessVerified(true);
-      setShowAccessPrompt(false);
-      return true;
-    } catch (error) {
-      if (error.status === 404 && tokenLooksLikeFloyoKey(nextToken)) {
-        setAccessToken(nextToken);
-        setAccessAccountId(DEFAULT_ACCOUNT_ID);
-        writeSessionAccess(nextToken, DEFAULT_ACCOUNT_ID);
-        setAccessVerified(true);
-        setShowAccessPrompt(false);
-        setAccessDenied(false);
-        setNotice("API key saved for this session. The next request will validate it with Floyo.");
-        window.setTimeout(() => setNotice(""), 3200);
-        return true;
-      }
-      setAccessVerified(false);
-      setAccessDenied(true);
-      return false;
-    } finally {
-      setIsCheckingAccess(false);
-    }
-  }, [accessAccountId, loadAccountConversations]);
-
-  useEffect(() => {
-    if (!config) {
-      return undefined;
-    }
-    if (!requiresAccessToken) {
-      setAccessVerified(true);
-      setAccessDenied(false);
-      return undefined;
-    }
-    if (accessVerified) {
-      return undefined;
-    }
-    if (!accessToken.trim()) {
-      setAccessVerified(false);
-      return undefined;
-    }
-
-    let isCancelled = false;
-    setIsCheckingAccess(true);
-    setAccessDenied(false);
-
-    apiRequest(
-      "/api/access/verify",
-      {
-        method: "POST",
-        body: JSON.stringify({}),
-      },
-      accessToken,
-    )
-      .then((verification) => {
-        if (!isCancelled) {
-          const nextAccountId = verification.accountId || DEFAULT_ACCOUNT_ID;
-          setAccessAccountId(nextAccountId);
-          writeSessionAccess(accessToken, nextAccountId);
-          if (nextAccountId !== accessAccountId) {
-            loadAccountConversations(nextAccountId);
-          }
-          setAccessVerified(true);
-        }
-      })
-      .catch((error) => {
-        if (!isCancelled) {
-          if (error.status === 404 && accessToken.trim() && tokenLooksLikeFloyoKey(accessToken)) {
-            setAccessVerified(true);
-            setAccessDenied(false);
-            return;
-          }
-          setAccessVerified(false);
-          setAccessDenied(true);
-        }
-      })
-      .finally(() => {
-        if (!isCancelled) {
-          setIsCheckingAccess(false);
-        }
-      });
-
-    return () => {
-      isCancelled = true;
-    };
-  }, [accessAccountId, accessToken, accessVerified, config, loadAccountConversations, requiresAccessToken]);
+    localStorage.setItem(CONVERSATIONS_STORAGE_KEY, JSON.stringify(conversations));
+  }, [conversations]);
 
   useEffect(() => {
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: "smooth" });
@@ -1348,23 +1169,6 @@ export default function App() {
     },
     [showNotice],
   );
-
-  const promptForAccess = useCallback((action) => {
-    setPendingAccessAction(action);
-    setAccessDenied(false);
-    setShowAccessPrompt(true);
-  }, []);
-
-  const handleChangeAccessKey = useCallback(() => {
-    clearSessionAccess();
-    setAccessToken("");
-    setAccessVerified(false);
-    setAccessDenied(false);
-    setAccessAccountId(DEFAULT_ACCOUNT_ID);
-    loadAccountConversations(DEFAULT_ACCOUNT_ID);
-    setPendingAccessAction(null);
-    setShowAccessPrompt(true);
-  }, [loadAccountConversations]);
 
   const handleModelSelect = useCallback((model, patch = {}) => {
     setSettings((current) => ({
@@ -1502,7 +1306,6 @@ export default function App() {
           method: "POST",
           body: formData,
         },
-        accessToken,
       );
       return {
         ...serializeAttachment(attachment),
@@ -1510,44 +1313,26 @@ export default function App() {
         status: "uploaded",
       };
     },
-    [accessToken],
+    [],
   );
 
-  const previewWorkflow = useCallback(async ({ skipAccessCheck = false, promptOverride = "" } = {}) => {
-    if (isAccessLocked && !skipAccessCheck) {
-      promptForAccess({ type: "preview", prompt: draft.trim() });
-      return;
-    }
+  const previewWorkflow = useCallback(async ({ promptOverride = "" } = {}) => {
     const prompt = promptOverride || draft.trim() || "Describe the uploaded media.";
-    let preview;
-    try {
-      preview = await apiRequest(
-        "/api/workflow/preview",
-        {
-          method: "POST",
-          body: JSON.stringify({
-            prompt,
-            messages: messages.filter((message) => message.id !== "seed" && !message.loading),
-            options: requestSettings,
-            media: [],
-          }),
-        },
-        accessToken,
-      );
-    } catch (error) {
-      if (error.status === 401) {
-        clearSessionAccess();
-        setAccessToken("");
-        setAccessVerified(false);
-        setAccessDenied(true);
-        promptForAccess({ type: "preview" });
-        return;
-      }
-      throw error;
-    }
+    const preview = await apiRequest(
+      "/api/workflow/preview",
+      {
+        method: "POST",
+        body: JSON.stringify({
+          prompt,
+          messages: messages.filter((message) => message.id !== "seed" && !message.loading),
+          options: requestSettings,
+          media: [],
+        }),
+      },
+    );
     setWorkflowPreview(preview);
     setShowAdvanced(true);
-  }, [accessToken, draft, isAccessLocked, messages, promptForAccess, requestSettings]);
+  }, [draft, messages, requestSettings]);
 
   const runFloyoPrompt = useCallback(
     async ({ prompt, history, pendingMessageId, userMessageId, attachments = [], workflowOptions = requestSettings }) => {
@@ -1606,9 +1391,9 @@ export default function App() {
           {
             method: "POST",
             body: JSON.stringify({
-            prompt,
-            messages: history,
-            options: workflowOptions,
+              prompt,
+              messages: history,
+              options: workflowOptions,
               media: uploadedAttachments.map((attachment) => ({
                 id: attachment.id,
                 inputPath: attachment.inputPath,
@@ -1621,7 +1406,6 @@ export default function App() {
               pollTimeoutMs: 180000,
             }),
           },
-          accessToken,
         );
 
         if (processingTimer) window.clearTimeout(processingTimer);
@@ -1659,13 +1443,6 @@ export default function App() {
         );
       } catch (error) {
         if (processingTimer) window.clearTimeout(processingTimer);
-        if (error.status === 401) {
-          clearSessionAccess();
-          setAccessToken("");
-          setAccessVerified(false);
-          setAccessDenied(true);
-          setShowAccessPrompt(true);
-        }
         updateActiveMessages((current) =>
           current.map((message) =>
             message.id === pendingMessageId
@@ -1684,17 +1461,13 @@ export default function App() {
         inputRef.current?.focus();
       }
     },
-    [accessToken, requestSettings, updateActiveMessages, uploadAttachment],
+    [requestSettings, updateActiveMessages, uploadAttachment],
   );
 
-  const sendMessage = useCallback(async ({ skipAccessCheck = false, promptOverride = "" } = {}) => {
+  const sendMessage = useCallback(async ({ promptOverride = "" } = {}) => {
     const attachments = pendingAttachments;
     const prompt = promptOverride || draft.trim() || (attachments.length ? "Describe the uploaded media." : "");
     if ((!prompt && !attachments.length) || isRunning) {
-      return;
-    }
-    if (isAccessLocked && !skipAccessCheck) {
-      promptForAccess({ type: "send", prompt });
       return;
     }
 
@@ -1731,11 +1504,9 @@ export default function App() {
     });
   }, [
     draft,
-    isAccessLocked,
     isRunning,
     messages,
     pendingAttachments,
-    promptForAccess,
     runFloyoPrompt,
     updateActiveMessages,
   ]);
@@ -1754,13 +1525,9 @@ export default function App() {
   }, []);
 
   const submitEditedMessage = useCallback(
-    async (messageId, { skipAccessCheck = false } = {}) => {
+    async (messageId) => {
       const prompt = editingText.trim();
       if (!prompt || isRunning) {
-        return;
-      }
-      if (isAccessLocked && !skipAccessCheck) {
-        promptForAccess({ type: "edit", messageId });
         return;
       }
 
@@ -1798,38 +1565,15 @@ export default function App() {
     },
     [
       editingText,
-      isAccessLocked,
       isRunning,
       messages,
-      promptForAccess,
       runFloyoPrompt,
       updateActiveMessages,
     ],
   );
 
-  useEffect(() => {
-    if (!accessVerified || !pendingAccessAction) {
-      return;
-    }
-
-    const action = pendingAccessAction;
-    setPendingAccessAction(null);
-
-    if (action.type === "send") {
-      void sendMessage({ skipAccessCheck: true, promptOverride: action.prompt || "" });
-    }
-
-    if (action.type === "preview") {
-      void previewWorkflow({ skipAccessCheck: true, promptOverride: action.prompt || "" });
-    }
-
-    if (action.type === "edit" && action.messageId) {
-      void submitEditedMessage(action.messageId, { skipAccessCheck: true });
-    }
-  }, [accessVerified, pendingAccessAction, previewWorkflow, sendMessage, submitEditedMessage]);
-
   return (
-    <div className={classNames("app-shell", showAdvanced && "advanced-open")}>
+    <div className={classNames("app-shell", showAdvanced && "advanced-open", sidebarCollapsed && "sidebar-collapsed")}>
       <HistorySidebar
         conversations={conversations}
         activeConversationId={activeConversation?.id}
@@ -1848,7 +1592,28 @@ export default function App() {
         onNew={createNewChat}
         onDelete={deleteChat}
         onReset={resetCurrentChat}
+        collapsed={sidebarCollapsed}
+        onToggleCollapsed={toggleSidebar}
       />
+      {sidebarCollapsed ? (
+        <button
+          type="button"
+          className="sidebar-open-button"
+          onClick={toggleSidebar}
+          aria-label="Open sidebar"
+          title="Open sidebar"
+        >
+          <PanelLeft size={18} />
+        </button>
+      ) : (
+        <button
+          type="button"
+          className="sidebar-scrim"
+          onClick={toggleSidebar}
+          aria-label="Close sidebar overlay"
+          tabIndex={-1}
+        />
+      )}
 
       <section className={classNames("chat-shell", isEmptyChat && "empty-chat")}>
         <header className="chat-header">
@@ -1857,12 +1622,7 @@ export default function App() {
             <p>{mediaLocked ? `${QWEN_MODEL_LABEL} · Media request` : `${effectiveModelLabel} · ${usesQwenWorkflow ? "Multimodal" : "LLM"}`}</p>
           </div>
           <div className="chat-header-actions">
-            <StatusPill config={config} accessVerified={accessVerified} requiresAccessToken={requiresAccessToken} />
-            {requiresAccessToken ? (
-              <button type="button" className="icon-button ghost" onClick={handleChangeAccessKey} title="Change API key">
-                <KeyRound size={17} />
-              </button>
-            ) : null}
+            <StatusPill config={config} />
             <button type="button" className={classNames("pill-button", showAdvanced && "active")} onClick={() => setShowAdvanced((value) => !value)}>
               <Settings2 size={16} />
               Advanced
@@ -2011,20 +1771,6 @@ export default function App() {
         onCopy={handleCopy}
         onClose={() => setShowAdvanced(false)}
       />
-
-      {showAccessPrompt ? (
-        <AccessGate
-          accessToken={accessToken}
-          accessDenied={accessDenied}
-          isCheckingAccess={isCheckingAccess}
-          onVerifyAccessToken={verifyAccessToken}
-          onCancel={() => {
-            setShowAccessPrompt(false);
-            setPendingAccessAction(null);
-            setAccessDenied(false);
-          }}
-        />
-      ) : null}
 
       {notice ? <div className="toast">{notice}</div> : null}
     </div>

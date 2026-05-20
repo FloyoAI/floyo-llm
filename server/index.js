@@ -1,6 +1,5 @@
 import dotenv from "dotenv";
 import express from "express";
-import crypto from "node:crypto";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import multer from "multer";
@@ -24,7 +23,6 @@ import {
   pollRun,
   retrieveRun,
   uploadFileToFloyo,
-  validateFloyoApiKey,
 } from "./floyo.js";
 
 dotenv.config();
@@ -50,111 +48,23 @@ app.use("/api", (_request, response, next) => {
   next();
 });
 
-function expectedAccessToken() {
-  return String(process.env.APP_ACCESS_TOKEN || "").trim();
-}
-
 function configuredFloyoApiKey() {
   const apiKey = String(process.env.FLOYO_API_KEY || "").trim();
   return apiKey && apiKey !== "YOUR_FLOYO_API_KEY" ? apiKey : "";
 }
 
-function tokenFingerprint(token) {
-  return crypto.createHash("sha256").update(String(token || "")).digest("hex");
-}
-
-function accountIdFromFingerprint(fingerprint) {
-  return `acct_${fingerprint.slice(0, 24)}`;
-}
-
-function tokenMatchesExpectedAccessToken(token) {
-  const expectedToken = expectedAccessToken();
-  return Boolean(expectedToken && timingSafeEquals(token, expectedToken));
-}
-
-function tokenMatchesConfiguredFloyoApiKey(token) {
-  const apiKey = configuredFloyoApiKey();
-  return Boolean(apiKey && timingSafeEquals(token, apiKey));
-}
-
-function tokenLooksLikeFloyoApiKey(token) {
-  return String(token || "").trim().startsWith("flo_");
-}
-
-function timingSafeEquals(left, right) {
-  const leftBuffer = Buffer.from(left);
-  const rightBuffer = Buffer.from(right);
-  if (leftBuffer.length !== rightBuffer.length) {
-    return false;
+// Every Floyo call uses the server-side key from .env. The Floyo API key is
+// NEVER read from the request, the URL, or any header. This is a deliberate
+// security boundary: API keys must not be handled in the browser.
+function requireServerKey(_request, response, next) {
+  if (!configuredFloyoApiKey()) {
+    response.status(503).json({
+      error: "Server misconfigured",
+      message: "FLOYO_API_KEY is not set on the server. Add it to your .env (local) or to your Vercel project Environment Variables.",
+    });
+    return;
   }
-  return crypto.timingSafeEqual(leftBuffer, rightBuffer);
-}
-
-function providedAccessToken(request) {
-  const directToken = String(request.get("x-floyo-app-token") || "").trim();
-  if (directToken) {
-    return directToken;
-  }
-
-  const authorization = String(request.get("authorization") || "").trim();
-  return authorization.toLowerCase().startsWith("bearer ") ? authorization.slice(7).trim() : "";
-}
-
-async function resolveAccess(token, { validate = false } = {}) {
-  const fingerprint = tokenFingerprint(token);
-  const accountId = accountIdFromFingerprint(fingerprint);
-
-  if (tokenMatchesExpectedAccessToken(token)) {
-    if (!configuredFloyoApiKey()) {
-      return {
-        ok: false,
-        status: 503,
-        message: "FLOYO_API_KEY is required before the app access token can run Floyo workflows.",
-        accountId,
-        cached: false,
-      };
-    }
-
-    const access = {
-      ok: true,
-      mode: "app",
-      accountId,
-      cached: false,
-      floyoContext: {},
-    };
-
-    if (validate) {
-      await validateFloyoApiKey(access.floyoContext);
-    }
-
-    return access;
-  }
-
-  if (tokenLooksLikeFloyoApiKey(token)) {
-    const access = {
-      ok: true,
-      mode: tokenMatchesConfiguredFloyoApiKey(token) ? "configured_floyo_key" : "floyo_key",
-      accountId,
-      cached: false,
-      floyoContext: {
-        apiKey: token,
-      },
-    };
-
-    if (validate) {
-      await validateFloyoApiKey(access.floyoContext);
-    }
-
-    return access;
-  }
-
-  return {
-    ok: false,
-    status: 401,
-    message: "Invalid access token or Floyo API key.",
-    accountId,
-    cached: false,
-  };
+  next();
 }
 
 function publicUploadMetadata(uploaded = {}, fallback = {}) {
@@ -232,35 +142,6 @@ async function prepareMediaForWorkflow(media = [], floyoContext = {}) {
   return prepared;
 }
 
-async function requireAppAccess(request, response, next) {
-  const token = providedAccessToken(request);
-
-  if (!token) {
-    response.status(401).json({
-      error: "Unauthorized",
-      message: "Enter a Floyo API key or app access token.",
-    });
-    return;
-  }
-
-  try {
-    const access = await resolveAccess(token);
-    if (!access.ok) {
-      response.status(access.status || 401).json({
-        error: access.status === 503 ? "Access token not configured" : "Unauthorized",
-        message: access.message,
-      });
-      return;
-    }
-
-    request.floyoContext = access.floyoContext;
-    request.accessAccountId = access.accountId;
-    next();
-  } catch (error) {
-    next(error);
-  }
-}
-
 const chatSchema = z.object({
   prompt: z.string().min(1, "Prompt is required"),
   messages: z
@@ -323,9 +204,6 @@ const chatSchema = z.object({
 app.get("/api/config", (_request, response) => {
   response.json({
     ...getPublicConfig(),
-    requiresAccessToken: Boolean(
-      expectedAccessToken() || process.env.VERCEL || process.env.NODE_ENV === "production" || !configuredFloyoApiKey(),
-    ),
     defaults: DEFAULT_OPTIONS,
     models: LLM_MODELS,
     qwenModel: {
@@ -336,45 +214,17 @@ app.get("/api/config", (_request, response) => {
   });
 });
 
-app.post("/api/access/verify", async (request, response, next) => {
-  try {
-    const token = providedAccessToken(request);
-    if (!token) {
-      response.status(401).json({
-        error: "Unauthorized",
-        message: "Enter a Floyo API key or app access token.",
-      });
-      return;
-    }
-
-    const access = await resolveAccess(token, { validate: true });
-    if (access.ok) {
-      response.json({
-        ok: true,
-        mode: access.mode,
-        accountId: access.accountId,
-        cached: false,
-      });
-      return;
-    }
-
-    response.status(access.status || 401).json({
-      error: access.status === 503 ? "Access token not configured" : "Unauthorized",
-      message: access.message,
-    });
-  } catch (error) {
-    if (error.status === 401 || error.status === 403) {
-      response.status(401).json({
-        error: "Unauthorized",
-        message: "Invalid Floyo API key or app access token.",
-      });
-      return;
-    }
-    next(error);
-  }
+app.post("/api/access/verify", (_request, response) => {
+  // This endpoint used to accept a Floyo API key from the browser. The new
+  // architecture forbids that: the key lives only on the server. Kept as a
+  // stub so any cached client build sees a clear 410 instead of a 404.
+  response.status(410).json({
+    error: "Gone",
+    message: "This endpoint was removed. The Floyo API key is server-side only and is not entered from the browser.",
+  });
 });
 
-app.post("/api/files/upload", requireAppAccess, upload.single("file"), async (request, response, next) => {
+app.post("/api/files/upload", requireServerKey, upload.single("file"), async (request, response, next) => {
   try {
     if (!request.file) {
       response.status(400).json({
@@ -401,7 +251,7 @@ app.post("/api/files/upload", requireAppAccess, upload.single("file"), async (re
     formData.append("filename", fileName);
     formData.append("on_conflict", String(request.body?.on_conflict || "rename"));
 
-    const uploaded = await uploadFileToFloyo(formData, request.floyoContext || {});
+    const uploaded = await uploadFileToFloyo(formData, {});
     response.json({
       ok: true,
       file: publicUploadMetadata(uploaded, {
@@ -416,14 +266,14 @@ app.post("/api/files/upload", requireAppAccess, upload.single("file"), async (re
   }
 });
 
-app.post("/api/workflow/preview", requireAppAccess, async (request, response, next) => {
+app.post("/api/workflow/preview", requireServerKey, async (request, response, next) => {
   try {
     const parsed = chatSchema.partial({ prompt: true }).parse({
       ...request.body,
       prompt: request.body?.prompt || "Describe the uploaded media.",
     });
     const prompt = buildPromptFromMessages(parsed.messages, parsed.prompt);
-    const media = await prepareMediaForWorkflow(parsed.media, request.floyoContext || {});
+    const media = await prepareMediaForWorkflow(parsed.media, {});
     const workflowPayload = buildFloyoGPTWorkflow({
       prompt,
       options: parsed.options,
@@ -438,11 +288,11 @@ app.post("/api/workflow/preview", requireAppAccess, async (request, response, ne
   }
 });
 
-app.post("/api/chat", requireAppAccess, async (request, response, next) => {
+app.post("/api/chat", requireServerKey, async (request, response, next) => {
   try {
     const parsed = chatSchema.parse(request.body);
     const prompt = buildPromptFromMessages(parsed.messages, parsed.prompt);
-    const floyoContext = request.floyoContext || {};
+    const floyoContext = {};
     const media = await prepareMediaForWorkflow(parsed.media, floyoContext);
     const selection = getWorkflowSelection({ options: parsed.options, media });
     const workflowPayload = buildFloyoGPTWorkflow({
@@ -477,9 +327,9 @@ app.post("/api/chat", requireAppAccess, async (request, response, next) => {
   }
 });
 
-app.get("/api/runs/:runId", requireAppAccess, async (request, response, next) => {
+app.get("/api/runs/:runId", requireServerKey, async (request, response, next) => {
   try {
-    const floyoContext = request.floyoContext || {};
+    const floyoContext = {};
     const run = await retrieveRun(request.params.runId, floyoContext);
     const normalizedResult = await normalizeRunResult(run, floyoContext);
     response.json({
@@ -491,9 +341,9 @@ app.get("/api/runs/:runId", requireAppAccess, async (request, response, next) =>
   }
 });
 
-app.post("/api/runs/:runId/cancel", requireAppAccess, async (request, response, next) => {
+app.post("/api/runs/:runId/cancel", requireServerKey, async (request, response, next) => {
   try {
-    response.json(await cancelRun(request.params.runId, request.floyoContext || {}));
+    response.json(await cancelRun(request.params.runId, {}));
   } catch (error) {
     next(error);
   }

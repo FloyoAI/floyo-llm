@@ -2,6 +2,7 @@ node_modules
 dist
 .env
 .vercel
+.claude
 artifacts
 .DS_Store
 npm-debug.log*
